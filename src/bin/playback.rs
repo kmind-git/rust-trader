@@ -1,6 +1,7 @@
 use std::io::BufRead;
 
 use gotrader::fix::config::FixConfig;
+use gotrader::fix::log::LogConfig;
 use gotrader::fix::session::{Callback, Initiator, InitiatorConfig};
 
 struct NopCallback;
@@ -63,6 +64,7 @@ fn main() {
         host: config.get_or("SocketConnectHost", "localhost"),
         port: config.get_or("SocketConnectPort", "5001").parse().unwrap_or(5001),
         heart_bt_int: config.get_or("HeartBtInt", "30").parse().unwrap_or(30),
+        log: LogConfig::from_config(&config, "logs/playback"),
     };
 
     let mut initiator = Initiator::connect(initiator_cfg, Box::new(NopCallback)).expect("exchange is not connected");

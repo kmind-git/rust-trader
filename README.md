@@ -10,7 +10,7 @@ go-trader 的 Rust 重写（自研底座）。价格-时间优先撮合引擎、
 
 ```bash
 cargo build --release   # 产物在 target/release/{exchange,client,playback}.exe
-cargo test              # 26 个单元测试（含翻译自 Go 版的撮合核心测试）
+cargo test              # 31 个单元测试（含翻译自 Go 版的撮合核心测试）
 ```
 
 ## 运行
@@ -38,6 +38,8 @@ curl http://localhost:8080/api/sessions
 
 交易所交互控制台：`help` / `sessions` / `book SYMBOL` / `list` / `quit`。
 
+FIX 接入采用预定义会话表：`configs/qf_got_settings` 的 `TargetCompIDs` 声明允许的客户端 CompID（未声明即拒，见 [docs/adr/0006-declared-session-admission.md](docs/adr/0006-declared-session-admission.md)）；`DynamicSessions=Y` 可恢复任意接入。
+
 ## 模块
 
 ```
@@ -50,8 +52,9 @@ src/
 │   └── stats.rs       # 统计聚合
 ├── fix/             # 手写最小 FIX 4.2 会话层（见 ADR-0001）
 │   ├── frame.rs       # tag=value 帧、BodyLength/CheckSum
-│   ├── codec.rs       # 业务消息编解码（D/F/G/i/c/x ↔ 8/b/d）
+│   ├── codec.rs       # 业务消息编解码（D/F/G/i ↔ 8/b/j/d）
 │   ├── session.rs     # acceptor + initiator
+│   ├── log.rs         # quickfixgo 风格 message/event 会话日志（见 ADR-0005）
 │   └── config.rs      # quickfix 风格配置解析
 ├── rest.rs          # 只读 REST（tiny_http，见 ADR-0002）
 └── bin/             # exchange / client / playback
@@ -63,5 +66,5 @@ FIX 端口/消息流/回报语义、REST 端点与 JSON 字段、撮合规则与
 
 ## 排错
 
-- FIX 交互失败时，用 `configs/qf_debug_settings`（Logging=Y）启动客户端，quickfixgo 会打印逐条消息与拒绝原因。
-- Windows 下构建前确保没有残留的 exchange/client/playback 进程锁住 target 下的 exe。
+- **FIX 会话日志**：每个会话两个文件（quickfixgo 风格）。acceptor 写 `logs/exchange/{BeginString-Sender-Target}.messages|event.current.log`；client 写 `logs/client/`、playback 写 `logs/playback/`。messages 记每条收发报文原文（`in`/`out` 方向前缀，含心跳）；event 记会话事件（登录/注销/序列号/超时，措辞对齐 quickfixgo）。settings 键 `Logging=Y/N`（默认 Y）与 `FileLogPath`（默认见上）可覆盖，见 ADR-0005。
+- Windows 下构建前确保没有残留的 exchange/client/playback 进程锁住 target 下的 exe；运行前确认 8080/5001 端口未被占用（报 os error 10048 即端口冲突）。

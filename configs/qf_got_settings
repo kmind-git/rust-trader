@@ -7,5 +7,7 @@ UseDataDictionary=false
 ResetOnLogout=Y
 ResetOnDisconnect=Y
 PersistMessages=N
-Logging=N
-DynamicSessions=Y
+Logging=Y
+DynamicSessions=N
+# declared client sessions: only these CompIDs may log on (ADR-0006)
+TargetCompIDs=CLIENT,PLAYBACK

@@ -5,4 +5,4 @@ SocketConnectHost=localhost
 SocketConnectPort=5001
 HeartBtInt=30
 ResetOnDisconnect=Y
-Logging=N
+Logging=Y

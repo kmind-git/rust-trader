@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use gotrader::core::exchange::Engine;
 use gotrader::core::orderbook::Book;
 use gotrader::fix::config::FixConfig;
-use gotrader::fix::session::{run_acceptor, AcceptorConfig};
+use gotrader::fix::log::LogConfig;
+use gotrader::fix::session::{run_acceptor, AcceptorConfig, Admission};
 use gotrader::rest;
 
 fn main() {
@@ -34,10 +35,28 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // engine-level admission: DynamicSessions=Y restores accept-all; otherwise
+    // only the declared TargetCompIDs may log on (quickfix default model)
+    let admission = if fix_config.get_or("DynamicSessions", "N").eq_ignore_ascii_case("Y") {
+        Admission::Dynamic
+    } else {
+        let targets: Vec<String> = fix_config
+            .get_or("TargetCompIDs", "")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if targets.is_empty() {
+            log::warn!("no TargetCompIDs declared and DynamicSessions!=Y: all FIX logons will be rejected");
+        }
+        Admission::Declared(targets)
+    };
     let acceptor_cfg = AcceptorConfig {
         port: fix_config.get_or("SocketAcceptPort", "5001").parse().unwrap_or(5001),
         sender_comp_id: fix_config.get_or("SenderCompID", "GOX"),
         begin_string: fix_config.get_or("BeginString", "FIX.4.2"),
+        log: LogConfig::from_config(&fix_config, "logs/exchange"),
+        admission,
     };
 
     // read-only REST api

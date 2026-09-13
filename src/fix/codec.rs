@@ -179,9 +179,11 @@ pub fn build_new_order_single(
 
 pub struct OrderIdForWire(pub String);
 
-pub fn build_cancel_request(cl_ord_id: &str, symbol: &str, side: Side) -> Vec<(u32, String)> {
+/// OrderCancelRequest: ClOrdID is the request's own fresh id; OrigClOrdID
+/// identifies the order being cancelled
+pub fn build_cancel_request(orig_cl_ord_id: &str, cl_ord_id: &str, symbol: &str, side: Side) -> Vec<(u32, String)> {
     vec![
-        (tags::ORIG_CL_ORD_ID, cl_ord_id.to_string()),
+        (tags::ORIG_CL_ORD_ID, orig_cl_ord_id.to_string()),
         (tags::CL_ORD_ID, cl_ord_id.to_string()),
         (tags::SYMBOL, symbol.to_string()),
         (tags::SIDE, side_to_fix(side).to_string()),
@@ -189,7 +191,10 @@ pub fn build_cancel_request(cl_ord_id: &str, symbol: &str, side: Side) -> Vec<(u
     ]
 }
 
+/// OrderCancelReplaceRequest: ClOrdID is the fresh request id and becomes the
+/// replacement order's ClOrdID; OrigClOrdID identifies the original order
 pub fn build_cancel_replace(
+    orig_cl_ord_id: &str,
     cl_ord_id: &str,
     symbol: &str,
     side: Side,
@@ -197,7 +202,7 @@ pub fn build_cancel_replace(
     quantity: Decimal,
 ) -> Vec<(u32, String)> {
     vec![
-        (tags::ORIG_CL_ORD_ID, cl_ord_id.to_string()),
+        (tags::ORIG_CL_ORD_ID, orig_cl_ord_id.to_string()),
         (tags::CL_ORD_ID, cl_ord_id.to_string()),
         (tags::HANDL_INST, "1".to_string()), // required in FIX 4.2
         (tags::SYMBOL, symbol.to_string()),
@@ -310,8 +315,8 @@ pub enum Inbound {
     TestRequest { test_req_id: String },
     ResendRequest,
     NewOrderSingle { cl_ord_id: i32, symbol: String, side: Side, order_type: OrderType, price: Decimal, quantity: Decimal },
-    CancelRequest { cl_ord_id: i32 },
-    CancelReplace { cl_ord_id: i32, price: Decimal, quantity: Decimal },
+    CancelRequest { cl_ord_id: i32, orig_cl_ord_id: i32 },
+    CancelReplace { cl_ord_id: i32, orig_cl_ord_id: i32, price: Decimal, quantity: Decimal },
     MassQuote { quote_id: String, ack: bool, symbol: String, bid_px: Decimal, bid_qty: Decimal, offer_px: Decimal, offer_qty: Decimal },
     SecurityDefinition { req_id: String, symbol: String, instrument_id: i64 },
     BusinessReject { reason: String },
@@ -369,18 +374,24 @@ pub fn decode(message: &super::frame::FixMessage) -> Result<Inbound, String> {
             })
         }
         msg_type::ORDER_CANCEL_REQUEST => {
-            // the Go acceptor cancels by ClOrdID (tag 11), falling back to 41
+            // the Go acceptor cancels by ClOrdID (tag 11), falling back to 41;
+            // spec-style clients send a fresh 11 and point 41 at the order
             let cl_ord_id = match get(tags::CL_ORD_ID) {
                 Some(v) => v.parse::<i32>().map_err(|e| format!("tag 11: {}", e))?,
                 None => num(tags::ORIG_CL_ORD_ID)?,
             };
-            Ok(Inbound::CancelRequest { cl_ord_id })
+            let orig_cl_ord_id = get(tags::ORIG_CL_ORD_ID)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(cl_ord_id);
+            Ok(Inbound::CancelRequest { cl_ord_id, orig_cl_ord_id })
         }
-        msg_type::ORDER_CANCEL_REPLACE_REQUEST => Ok(Inbound::CancelReplace {
-            cl_ord_id: num(tags::CL_ORD_ID)?,
-            price: dec(tags::PRICE)?,
-            quantity: dec(tags::ORDER_QTY)?,
-        }),
+        msg_type::ORDER_CANCEL_REPLACE_REQUEST => {
+            let cl_ord_id = num(tags::CL_ORD_ID)?;
+            let orig_cl_ord_id = get(tags::ORIG_CL_ORD_ID)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(cl_ord_id);
+            Ok(Inbound::CancelReplace { cl_ord_id, orig_cl_ord_id, price: dec(tags::PRICE)?, quantity: dec(tags::ORDER_QTY)? })
+        }
         msg_type::MASS_QUOTE => {
             let sets = need(tags::NO_QUOTE_SETS)?;
             if sets != "1" {

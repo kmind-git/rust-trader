@@ -197,36 +197,53 @@ impl Engine {
         Ok(new.id)
     }
 
-    /// mirrors exchange.ModifyOrder: remove + re-add, so time priority resets
+    /// mirrors exchange.ModifyOrder: remove + re-add, so time priority resets.
+    /// The replacement order takes the cancel-replace request's ClOrdID
+    /// (new_id); when it differs from the original, the original order is
+    /// reported Cancelled under its own id first. Reusing the same id keeps
+    /// the old single-report in-place semantics (Go-style clients).
     pub fn modify_order(
         &mut self,
         session_id: &str,
-        id: OrderId,
+        orig_id: OrderId,
+        new_id: OrderId,
         price: Decimal,
         quantity: Decimal,
     ) -> Result<(), EngineError> {
         let entry = {
             let session = self.sessions.get(session_id).ok_or(EngineError::OrderNotFound)?;
-            session.orders.get(&id).ok_or(EngineError::OrderNotFound)?.clone()
+            session.orders.get(&orig_id).ok_or(EngineError::OrderNotFound)?.clone()
         };
         if !entry.state.is_active() {
             return Err(EngineError::OrderIsNotActive);
         }
+        let instrument_id = entry.instrument_id;
 
-        let removed = match self.remove_from_book(session_id, id, entry.side, entry.price, entry.instrument_id) {
+        let removed = match self.remove_from_book(session_id, orig_id, entry.side, entry.price, instrument_id) {
             Ok(removed) => removed,
             Err(_) => {
                 // order exists in the session but not in the book: report and
                 // ignore, mirroring the Go behavior
-                let record = self.sessions.get(session_id).unwrap().orders.get(&id).unwrap().clone();
+                let record = self.sessions.get(session_id).unwrap().orders.get(&orig_id).unwrap().clone();
                 self.send_status(record);
                 return Ok(());
             }
         };
-        self.record_book(entry.instrument_id);
+        self.record_book(instrument_id);
+
+        if new_id != orig_id {
+            // the original order is superseded: terminal report under its id
+            let mut old = removed;
+            if old.state.is_active() {
+                old.state = OrderState::Cancelled;
+            }
+            self.sessions.get_mut(session_id).unwrap().orders.remove(&orig_id);
+            self.send_status(old);
+        }
 
         self.next_arrival += 1;
-        let mut order = removed;
+        let mut order = entry;
+        order.id = new_id;
         order.price = price;
         order.quantity = quantity;
         order.remaining = quantity;
@@ -237,10 +254,10 @@ impl Engine {
             .get_mut(session_id)
             .unwrap()
             .orders
-            .insert(id, order.clone());
+            .insert(new_id, order.clone());
 
         let (mut trades, final_state) = self.add_to_book(order);
-        let book = self.build_book(entry.instrument_id);
+        let book = self.build_book(instrument_id);
         self.record_market_data(book, &trades);
         self.send_trade_reports(&mut trades);
         if let Some(final_order) = &final_state {

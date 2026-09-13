@@ -18,6 +18,7 @@ use crate::core::order::{OrderId, OrderState, OrderType, Side};
 
 use super::codec::{self, msg_type, Inbound};
 use super::frame;
+use super::log::{LogConfig, SessionLog};
 
 // ---------- shared plumbing ----------
 
@@ -68,6 +69,7 @@ struct WriterState {
     sender_comp_id: String,
     target_comp_id: String,
     seq: u64,
+    log: SessionLog,
 }
 
 fn writer_loop(mut state: WriterState, rx: Receiver<OutMsg>, idle: Duration) {
@@ -85,6 +87,7 @@ fn writer_loop(mut state: WriterState, rx: Receiver<OutMsg>, idle: Duration) {
             OutMsg::GapFill => {
                 state.seq += 1;
                 let this_seq = state.seq;
+                state.log.event(&format!("Sent SequenceReset TO: {}", this_seq + 1));
                 (
                     msg_type::SEQUENCE_RESET,
                     vec![
@@ -105,6 +108,7 @@ fn writer_loop(mut state: WriterState, rx: Receiver<OutMsg>, idle: Duration) {
             &state.target_comp_id,
             &fields,
         );
+        state.log.outgoing(&String::from_utf8_lossy(&bytes));
         if state.stream.write_all(&bytes).is_err() || state.stream.flush().is_err() {
             break;
         }
@@ -118,6 +122,33 @@ pub struct AcceptorConfig {
     pub port: u16,
     pub sender_comp_id: String,
     pub begin_string: String,
+    pub log: LogConfig,
+    /// engine-level admission (ADR-0006): quickfix's default model only
+    /// accepts declared sessions; DynamicSessions=Y restores accept-all
+    pub admission: Admission,
+}
+
+/// which client CompIDs may log on
+#[derive(Clone, Debug)]
+pub enum Admission {
+    /// any CompID (go-trader's DynamicSessions=Y behavior)
+    Dynamic,
+    /// only these client CompIDs (the declared session table)
+    Declared(Vec<String>),
+}
+
+fn client_admitted(admission: &Admission, client_comp_id: &str) -> bool {
+    match admission {
+        Admission::Dynamic => true,
+        Admission::Declared(targets) => targets.iter().any(|t| t == client_comp_id),
+    }
+}
+
+/// quickfixgo peerTimer semantics (session.go:567): probe the peer after
+/// 1.2x HeartBtInt of silence, disconnect after 2.4x
+fn peer_timeouts(heart_bt_int: u32) -> (Duration, Duration) {
+    let heart = Duration::from_secs(heart_bt_int.max(1) as u64);
+    (heart.mul_f64(1.2), heart.mul_f64(2.4))
 }
 
 /// blocking accept loop; spawn this on its own thread
@@ -147,9 +178,10 @@ fn handle_acceptor_connection(
     cfg: AcceptorConfig,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
-    let idle = Duration::from_secs(30);
     let mut reader = BufReader::new(stream.try_clone()?);
-    reader.get_ref().set_read_timeout(Some(idle))?;
+    // silence is measured in the loop (1.2x/2.4x HeartBtInt), so the socket
+    // read timeout is just a coarse poll tick
+    reader.get_ref().set_read_timeout(Some(Duration::from_millis(500)))?;
     let mut writer_stream = stream.try_clone()?;
 
     // logon handshake: first message must be a Logon addressed to us
@@ -157,30 +189,65 @@ fn handle_acceptor_connection(
         Some(message) => message,
         None => return Ok(()),
     };
+    let client_comp_id = match logon.get(49) {
+        Some(v) => v.to_string(),
+        None => {
+            log::warn!("logon without SenderCompID (49), closing");
+            return Ok(());
+        }
+    };
+    // engine-level admission: undeclared clients are rejected before any
+    // session state (or log file) is created for them
+    if !client_admitted(&cfg.admission, &client_comp_id) {
+        log::warn!("FIX logon from undeclared client {}, closing", client_comp_id);
+        return Ok(());
+    }
+    // per-session FIX logs start with the first received message
+    let session_log = if cfg.log.enabled {
+        match SessionLog::new(&cfg.log.dir, &cfg.begin_string, &cfg.sender_comp_id, &client_comp_id) {
+            Ok(log) => log,
+            Err(e) => {
+                log::warn!("unable to create FIX logs in {}: {}", cfg.log.dir, e);
+                SessionLog::disabled()
+            }
+        }
+    } else {
+        SessionLog::disabled()
+    };
+    session_log.incoming(&logon.raw);
+    session_log.event("Received logon request");
     if logon.msg_type() != Some(msg_type::LOGON) {
         log::warn!("first message was not a Logon, closing");
+        session_log.event("Failed handshake: first message was not a Logon");
         return Ok(());
     }
     if logon.begin_string != cfg.begin_string {
         log::warn!("unsupported FixVersion {}, closing", logon.begin_string);
+        session_log.event(&format!("Failed handshake: unsupported FixVersion {}", logon.begin_string));
         return Ok(());
     }
-    let client_comp_id = match logon.get(49) {
-        Some(v) => v.to_string(),
-        None => return Ok(()),
-    };
-    if let Some(target) = logon.get(56) {
-        if target != cfg.sender_comp_id {
-            log::warn!("logon for unknown target {}, closing", target);
+    let target = match logon.get(56) {
+        Some(t) => t,
+        None => {
+            log::warn!("logon without TargetCompID (56), closing");
+            session_log.event("Failed handshake: logon without TargetCompID (56)");
             return Ok(());
         }
+    };
+    if target != cfg.sender_comp_id {
+        log::warn!("logon for unknown target {}, closing", target);
+        session_log.event(&format!("Failed handshake: logon for unknown target {}", target));
+        return Ok(());
     }
     let heart_bt_int: u32 = logon.get(codec::tags::HEART_BT_INT).and_then(|v| v.parse().ok()).unwrap_or(30);
+    let (probe_after, close_after) = peer_timeouts(heart_bt_int);
+    let heart = Duration::from_secs(heart_bt_int.max(1) as u64);
 
     let session_id = format!("{}:{}->{}", cfg.begin_string, cfg.sender_comp_id, client_comp_id);
     let (tx, rx) = mpsc::channel::<OutMsg>();
     let (report_tx, report_rx) = mpsc::channel::<Report>();
     engine.lock().unwrap().register_session(&session_id, report_tx);
+    session_log.event(&format!("Created session {}", session_id));
     {
         // pump engine reports into the writer channel
         let tx = tx.clone();
@@ -198,6 +265,7 @@ fn handle_acceptor_connection(
 
     let begin_string = cfg.begin_string.clone();
     let sender_comp_id = cfg.sender_comp_id.clone();
+    let writer_log = session_log.clone();
     let writer = std::thread::Builder::new()
         .name(format!("fix-writer-{}", client_comp_id))
         .spawn(move || {
@@ -207,12 +275,14 @@ fn handle_acceptor_connection(
                 sender_comp_id,
                 target_comp_id: client_comp_id,
                 seq: 0,
+                log: writer_log,
             };
-            writer_loop(state, rx, idle.max(Duration::from_secs(5)))
+            writer_loop(state, rx, heart.max(Duration::from_secs(5)))
         })
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     // logon acknowledgement
+    session_log.event("Responding to logon request");
     tx.send(OutMsg::Message {
         msg_type: msg_type::LOGON,
         fields: codec::build_logon(heart_bt_int),
@@ -221,22 +291,27 @@ fn handle_acceptor_connection(
     log::info!("session {} logged on", session_id);
 
     let mut expected_in: u64 = 2; // the logon consumed sequence 1
-    let mut timeouts = 0u32;
+    let mut last_received = std::time::Instant::now();
+    let mut probed = false;
     loop {
         match frame::read_message(&mut reader) {
             Ok(None) => {
                 log::warn!("session {}: peer closed connection", session_id);
+                session_log.event("Connection Terminated");
                 break;
             }
             Ok(Some(msg)) => {
-                log::info!("session {}: inbound {} seq {:?} expected {}", session_id, msg.msg_type().unwrap_or("?"), msg.seq(), expected_in);
-                timeouts = 0;
+                session_log.incoming(&msg.raw);
+                last_received = std::time::Instant::now();
+                probed = false;
                 if msg.begin_string != cfg.begin_string {
+                    session_log.event(&format!("Discarded message with BeginString {}", msg.begin_string));
                     continue;
                 }
                 match msg.seq() {
                     Some(s) if s < expected_in => {
                         log::warn!("session {}: duplicate seq {}, expected {}", session_id, s, expected_in);
+                        session_log.event(&format!("MsgSeqNum too low, expecting {} but received {}", expected_in, s));
                         continue;
                     }
                     Some(s) if s > expected_in => {
@@ -244,11 +319,13 @@ fn handle_acceptor_connection(
                             "session {}: seq gap (got {}, expected {}), requesting resend",
                             session_id, s, expected_in
                         );
+                        session_log.event(&format!("MsgSeqNum too high, expecting {} but received {}", expected_in, s));
                         tx.send(OutMsg::Message {
                             msg_type: msg_type::RESEND_REQUEST,
                             fields: vec![(7, expected_in.to_string()), (16, "0".to_string())],
                         })
                         .ok();
+                        session_log.event(&format!("Sent ResendRequest FROM: {} TO: {}", expected_in, 0));
                         continue;
                     }
                     _ => {}
@@ -259,6 +336,7 @@ fn handle_acceptor_connection(
                     Ok(decoded) => decoded,
                     Err(e) => {
                         log::warn!("session {}: bad message: {}", session_id, e);
+                        session_log.event(&format!("Msg Parse Error: {}", e));
                         continue;
                     }
                 };
@@ -272,14 +350,23 @@ fn handle_acceptor_connection(
                         .ok();
                     }
                     Inbound::ResendRequest => {
+                        session_log.event("Received ResendRequest");
                         tx.send(OutMsg::GapFill).ok();
                     }
                     Inbound::Logout => {
+                        session_log.event("Received logout request");
                         tx.send(OutMsg::Message { msg_type: msg_type::LOGOUT, fields: vec![] }).ok();
+                        session_log.event("Sending logout response");
                         break;
                     }
-                    Inbound::Logon { .. } => log::warn!("session {}: duplicate logon ignored", session_id),
-                    Inbound::Unsupported(t) => log::warn!("session {}: unsupported msg type {}", session_id, t),
+                    Inbound::Logon { .. } => {
+                        log::warn!("session {}: duplicate logon ignored", session_id);
+                        session_log.event("Received duplicate logon request");
+                    }
+                    Inbound::Unsupported(t) => {
+                        log::warn!("session {}: unsupported msg type {}", session_id, t);
+                        session_log.event(&format!("Unsupported message type {}", t));
+                    }
                     inbound => {
                         let mut engine = engine.lock().unwrap();
                         handle_business(&mut engine, &session_id, &tx, inbound);
@@ -288,24 +375,31 @@ fn handle_acceptor_connection(
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
-                    timeouts += 1;
-                    if timeouts >= 2 {
-                        log::warn!("session {}: no data for {}s, closing", session_id, idle.as_secs() * 2);
+                    let silent = last_received.elapsed();
+                    if silent >= close_after {
+                        log::warn!("session {}: no data for {}s, closing", session_id, silent.as_secs());
+                        session_log.event("Session Timeout");
                         break;
                     }
-                    tx.send(OutMsg::Message {
-                        msg_type: msg_type::TEST_REQUEST,
-                        fields: codec::build_test_request("ARE-YOU-THERE"),
-                    })
-                    .ok();
+                    if silent >= probe_after && !probed {
+                        tx.send(OutMsg::Message {
+                            msg_type: msg_type::TEST_REQUEST,
+                            fields: codec::build_test_request("ARE-YOU-THERE"),
+                        })
+                        .ok();
+                        session_log.event("Sent test request");
+                        probed = true;
+                    }
                     continue;
                 }
                 log::warn!("session {}: read error: {} (kind {:?})", session_id, e, e.kind());
+                session_log.event(&format!("Connection Terminated: {}", e));
                 break;
             }
         }
     }
     engine.lock().unwrap().session_disconnect(&session_id);
+    session_log.event("Disconnected");
     log::info!("session {} disconnected", session_id);
     drop(tx);
     let _ = writer.join();
@@ -341,13 +435,22 @@ fn handle_business(engine: &mut Engine, session_id: &str, tx: &Sender<OutMsg>, i
                 log::warn!("create order failed: {}", e);
             }
         }
-        Inbound::CancelRequest { cl_ord_id } => {
-            if let Err(e) = engine.cancel_order(session_id, cl_ord_id) {
+        Inbound::CancelRequest { cl_ord_id, orig_cl_ord_id } => {
+            // spec-style clients send a fresh ClOrdID (11) and point OrigClOrdID
+            // (41) at the order; Go-style clients reuse the order id in 11
+            let result = engine.cancel_order(session_id, cl_ord_id).or_else(|e| {
+                if orig_cl_ord_id != cl_ord_id {
+                    engine.cancel_order(session_id, orig_cl_ord_id)
+                } else {
+                    Err(e)
+                }
+            });
+            if let Err(e) = result {
                 log::warn!("cancel order failed: {}", e);
             }
         }
-        Inbound::CancelReplace { cl_ord_id, price, quantity } => {
-            if let Err(e) = engine.modify_order(session_id, cl_ord_id, price, quantity) {
+        Inbound::CancelReplace { cl_ord_id, orig_cl_ord_id, price, quantity } => {
+            if let Err(e) = engine.modify_order(session_id, orig_cl_ord_id, cl_ord_id, price, quantity) {
                 log::warn!("modify order failed: {}", e);
             }
         }
@@ -415,6 +518,7 @@ struct InitiatorShared {
     callback: Mutex<Box<dyn Callback + Send>>,
     orders: Mutex<HashMap<OrderId, OrderView>>,
     instruments: Mutex<crate::core::instrument::InstrumentMap>,
+    log: SessionLog,
 }
 
 pub struct InitiatorConfig {
@@ -423,6 +527,7 @@ pub struct InitiatorConfig {
     pub host: String,
     pub port: u16,
     pub heart_bt_int: u32,
+    pub log: LogConfig,
 }
 
 pub struct Initiator {
@@ -449,7 +554,25 @@ impl std::fmt::Display for ConnectError {
 impl Initiator {
     /// connect, log on (blocking up to 30s), and start the session threads
     pub fn connect(cfg: InitiatorConfig, callback: Box<dyn Callback + Send>) -> Result<Initiator, ConnectError> {
-        let stream = TcpStream::connect((cfg.host.as_str(), cfg.port)).map_err(ConnectError::Io)?;
+        let session_log = if cfg.log.enabled {
+            match SessionLog::new(&cfg.log.dir, "FIX.4.2", &cfg.sender_comp_id, &cfg.target_comp_id) {
+                Ok(log) => log,
+                Err(e) => {
+                    log::warn!("unable to create FIX logs in {}: {}", cfg.log.dir, e);
+                    SessionLog::disabled()
+                }
+            }
+        } else {
+            SessionLog::disabled()
+        };
+        session_log.event(&format!("Connecting to: {}:{}", cfg.host, cfg.port));
+        let stream = match TcpStream::connect((cfg.host.as_str(), cfg.port)) {
+            Ok(stream) => stream,
+            Err(e) => {
+                session_log.event(&format!("Failed to connect: {}", e));
+                return Err(ConnectError::Io(e));
+            }
+        };
         stream.set_nodelay(true).ok();
         let mut reader_stream = stream.try_clone().map_err(ConnectError::Io)?;
         reader_stream.set_read_timeout(Some(Duration::from_secs(90))).ok();
@@ -463,6 +586,7 @@ impl Initiator {
             callback: Mutex::new(callback),
             orders: Mutex::new(HashMap::new()),
             instruments: Mutex::new(crate::core::instrument::InstrumentMap::new()),
+            log: session_log.clone(),
         });
 
         // writer thread
@@ -473,6 +597,7 @@ impl Initiator {
                 sender_comp_id: cfg.sender_comp_id.clone(),
                 target_comp_id: cfg.target_comp_id.clone(),
                 seq: 0,
+                log: session_log.clone(),
             };
             let idle = Duration::from_secs(cfg.heart_bt_int.max(5) as u64);
             std::thread::Builder::new()
@@ -494,19 +619,28 @@ impl Initiator {
                     loop {
                         let message = match frame::read_message(&mut reader) {
                             Ok(Some(message)) => message,
-                            Ok(None) => break,
-                            Err(_) => break,
+                            Ok(None) => {
+                                shared.log.event("Connection Terminated");
+                                break;
+                            }
+                            Err(_) => {
+                                shared.log.event("Session Timeout");
+                                break;
+                            }
                         };
+                        shared.log.incoming(&message.raw);
                         if message.get(56).map(|v| v != expected_target).unwrap_or(false) {
                             continue;
                         }
                         match message.seq() {
                             Some(s) if s < expected_in => {
                                 log::warn!("duplicate seq {}", s);
+                                shared.log.event(&format!("MsgSeqNum too low, expecting {} but received {}", expected_in, s));
                                 continue;
                             }
                             Some(s) if s > expected_in => {
                                 log::warn!("seq gap (got {}, expected {})", s, expected_in);
+                                shared.log.event(&format!("MsgSeqNum too high, expecting {} but received {} (processing anyway)", expected_in, s));
                                 // process anyway: as a client we can't afford to stall
                             }
                             _ => {}
@@ -516,12 +650,18 @@ impl Initiator {
                             Ok(decoded) => decoded,
                             Err(e) => {
                                 log::warn!("bad message: {}", e);
+                                shared.log.event(&format!("Msg Parse Error: {}", e));
                                 continue;
                             }
                         };
                         match decoded {
-                            Inbound::Logon { .. } => shared.logged_in.set(),
+                            Inbound::Logon { .. } => {
+                                shared.log.event("Received logon response");
+                                shared.log.event("In session");
+                                shared.logged_in.set();
+                            }
                             Inbound::Logout => {
+                                shared.log.event("Received logout request");
                                 log::info!("we are logged out!");
                                 shared.logged_in.reset();
                                 break;
@@ -549,6 +689,7 @@ impl Initiator {
                     }
                     shared.logged_in.reset();
                     shared.connected.reset();
+                    shared.log.event("Disconnected");
                     let _ = shutdown.send(OutMsg::Shutdown);
                 })
                 .map_err(ConnectError::Io)?;
@@ -560,11 +701,13 @@ impl Initiator {
             next_order: Mutex::new(0),
         };
         // log on and wait
+        session_log.event("Sending logon request");
         initiator
             .cmd_tx
             .send(OutMsg::Message { msg_type: msg_type::LOGON, fields: codec::build_logon(cfg.heart_bt_int) })
             .map_err(|_| ConnectError::Timeout)?;
         if !initiator.shared.logged_in.wait_for(Duration::from_secs(30)) {
+            session_log.event("Timed out waiting for logon response");
             return Err(ConnectError::Timeout);
         }
         initiator.shared.connected.set();
@@ -589,6 +732,7 @@ impl Initiator {
     /// channel as order traffic, so pending messages are flushed first
     pub fn disconnect(&mut self) {
         if self.shared.connected.get() {
+            self.shared.log.event("Initiated logout request");
             self.cmd_tx
                 .send(OutMsg::Message { msg_type: msg_type::LOGOUT, fields: codec::build_logout() })
                 .ok();
@@ -649,15 +793,37 @@ impl Initiator {
 
     pub fn modify_order(&self, id: OrderId, price: Decimal, quantity: Decimal) -> Result<(), ()> {
         self.require_connected().map_err(|_| ())?;
-        let record = {
-            let mut orders = self.shared.orders.lock().unwrap();
-            let record = orders.get_mut(&id).ok_or(())?;
-            record.price = price;
-            record.quantity = quantity;
-            record.clone()
+        let (symbol, side) = {
+            let orders = self.shared.orders.lock().unwrap();
+            let record = orders.get(&id).ok_or(())?;
+            (record.symbol.clone(), record.side)
         };
+        // the cancel-replace request carries a fresh ClOrdID which becomes the
+        // replacement order's id; track it alongside the original (which will
+        // receive a Cancelled report)
+        let req_id = {
+            let mut next_order = self.next_order.lock().unwrap();
+            *next_order += 1;
+            *next_order
+        };
+        {
+            let mut orders = self.shared.orders.lock().unwrap();
+            orders.insert(
+                req_id,
+                OrderView {
+                    id: req_id,
+                    exchange_id: String::new(),
+                    symbol: symbol.clone(),
+                    side,
+                    price,
+                    quantity,
+                    remaining: quantity,
+                    state: OrderState::New,
+                },
+            );
+        }
         let fields =
-            codec::build_cancel_replace(&id.to_string(), &record.symbol, record.side, price, quantity);
+            codec::build_cancel_replace(&id.to_string(), &req_id.to_string(), &symbol, side, price, quantity);
         self.cmd_tx
             .send(OutMsg::Message { msg_type: msg_type::ORDER_CANCEL_REPLACE_REQUEST, fields })
             .map_err(|_| ())
@@ -670,7 +836,13 @@ impl Initiator {
             let record = orders.get(&id).ok_or(())?.clone();
             record
         };
-        let fields = codec::build_cancel_request(&id.to_string(), &record.symbol, record.side);
+        // fresh ClOrdID for the cancel request; OrigClOrdID points at the order
+        let req_id = {
+            let mut next_order = self.next_order.lock().unwrap();
+            *next_order += 1;
+            *next_order
+        };
+        let fields = codec::build_cancel_request(&id.to_string(), &req_id.to_string(), &record.symbol, record.side);
         self.cmd_tx
             .send(OutMsg::Message { msg_type: msg_type::ORDER_CANCEL_REQUEST, fields })
             .map_err(|_| ())
@@ -724,5 +896,33 @@ fn handle_execution_report(shared: &InitiatorShared, data: crate::fix::codec::Ex
 
     if let Some(view) = &order_view {
         shared.callback.lock().unwrap().on_order_status(view);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_client_admitted() {
+        let dynamic = Admission::Dynamic;
+        assert!(client_admitted(&dynamic, "ANYONE"));
+
+        let declared = Admission::Declared(vec!["CLIENT".to_string(), "PLAYBACK".to_string()]);
+        assert!(client_admitted(&declared, "CLIENT"));
+        assert!(client_admitted(&declared, "PLAYBACK"));
+        assert!(!client_admitted(&declared, "INTRUDER"));
+        assert!(!client_admitted(&declared, ""));
+    }
+
+    #[test]
+    fn test_peer_timeouts() {
+        let (probe, close) = peer_timeouts(30);
+        assert_eq!(probe, Duration::from_secs(36));
+        assert_eq!(close, Duration::from_secs(72));
+        // minimal heartbeat value stays sane
+        let (probe, close) = peer_timeouts(1);
+        assert_eq!(probe, Duration::from_millis(1200));
+        assert_eq!(close, Duration::from_millis(2400));
     }
 }

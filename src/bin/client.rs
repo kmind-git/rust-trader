@@ -3,6 +3,7 @@ use std::io::BufRead;
 use gotrader::core::instrument::Instrument;
 use gotrader::core::order::Side;
 use gotrader::fix::config::FixConfig;
+use gotrader::fix::log::LogConfig;
 use gotrader::fix::session::{Callback, FillView, Initiator, InitiatorConfig, OrderView};
 
 struct PrintCallback;
@@ -59,11 +60,12 @@ fn main() {
         host: config.get_or("SocketConnectHost", "localhost"),
         port: config.get_or("SocketConnectPort", "5001").parse().unwrap_or(5001),
         heart_bt_int: config.get_or("HeartBtInt", "30").parse().unwrap_or(30),
+        log: LogConfig::from_config(&config, "logs/client"),
     };
 
     let mut initiator =
         Initiator::connect(initiator_cfg, Box::new(PrintCallback)).expect("exchange is not connected");
-    println!("commands: buy|sell SYMBOL QTY [PRICE]  (omit PRICE for a market order), quit");
+    println!("commands: buy|sell SYMBOL QTY [PRICE] | modify ID PRICE QTY | cancel ID | quit");
     let stdin = std::io::stdin();
     loop {
         print!("Command?");
@@ -106,7 +108,29 @@ fn main() {
                     println!("unable to submit order: not connected");
                 }
             }
-            Some(other) => println!("unknown command '{}', use buy|sell SYMBOL QTY [PRICE] or quit", other),
+            Some("cancel") => match parts.len() {
+                2 => match parts[1].parse::<i32>() {
+                    Ok(id) => {
+                        if initiator.cancel_order(id).is_err() {
+                            println!("unable to cancel order {} (unknown id or not connected)", id);
+                        }
+                    }
+                    Err(_) => println!("invalid order id {}", parts[1]),
+                },
+                _ => println!("usage: cancel ID"),
+            },
+            Some("modify") => match (parts.len(), parts[1].parse::<i32>()) {
+                (4, Ok(id)) => match (parts[2].parse::<rust_decimal::Decimal>(), parts[3].parse::<rust_decimal::Decimal>()) {
+                    (Ok(price), Ok(quantity)) => {
+                        if initiator.modify_order(id, price, quantity).is_err() {
+                            println!("unable to modify order {} (unknown id or not connected)", id);
+                        }
+                    }
+                    _ => println!("invalid price or quantity"),
+                },
+                _ => println!("usage: modify ID PRICE QTY"),
+            },
+            Some(other) => println!("unknown command '{}', use buy|sell SYMBOL QTY [PRICE] | modify ID PRICE QTY | cancel ID | quit", other),
         }
     }
     initiator.disconnect();

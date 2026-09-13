@@ -36,7 +36,7 @@ fn test_exchange_level_basics() {
     assert_eq!(order1.state, OrderState::Booked);
 
     // 2. modify the order
-    engine.modify_order("client1", oid1, "151.00".parse().unwrap(), "100".parse().unwrap()).unwrap();
+    engine.modify_order("client1", oid1, oid1, "151.00".parse().unwrap(), "100".parse().unwrap()).unwrap();
     let order1 = engine.sessions["client1"].orders.get(&1).unwrap().clone();
     assert_eq!(order1.price, "151".parse().unwrap(), "expected modified price 151");
 
@@ -65,7 +65,7 @@ fn test_exchange_level_basics() {
     assert_eq!(order1.remaining, "50".parse().unwrap());
 
     // 4. modifying an already filled order fails
-    let err = engine.modify_order("client2", 2, "150.00".parse().unwrap(), "10".parse().unwrap());
+    let err = engine.modify_order("client2", 2, 2, "150.00".parse().unwrap(), "10".parse().unwrap());
     assert_eq!(err, Err(EngineError::OrderIsNotActive));
 
     // 5. cross another order to fully fill the resting order
@@ -89,7 +89,7 @@ fn test_exchange_level_basics() {
     assert_eq!(order3.state, OrderState::Filled);
 
     // modifying the now filled resting order fails
-    let err = engine.modify_order("client1", 1, "152.00".parse().unwrap(), "100".parse().unwrap());
+    let err = engine.modify_order("client1", 1, 1, "152.00".parse().unwrap(), "100".parse().unwrap());
     assert_eq!(err, Err(EngineError::OrderIsNotActive));
 
     // report flow assertions (beyond the Go test: verifies the report wiring)
@@ -168,7 +168,7 @@ fn test_modify_not_found_and_quote_replace() {
     let inst_id = engine.create_instrument("IBM");
 
     // modify unknown order
-    let err = engine.modify_order("mm", 99, "1".parse().unwrap(), "1".parse().unwrap());
+    let err = engine.modify_order("mm", 99, 99, "1".parse().unwrap(), "1".parse().unwrap());
     assert_eq!(err, Err(EngineError::OrderNotFound));
 
     // quote, then re-quote replaces the pair

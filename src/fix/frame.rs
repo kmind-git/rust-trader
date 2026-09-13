@@ -10,6 +10,9 @@ pub const SOH: u8 = 0x01;
 pub struct FixMessage {
     pub begin_string: String,
     pub fields: Vec<(u32, String)>,
+    /// the message as it appeared on the wire (8=..|9=..|body|10=..), for the
+    /// FIX message log
+    pub raw: String,
 }
 
 impl FixMessage {
@@ -52,7 +55,8 @@ pub fn read_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<FixMes
 
     let body_str = String::from_utf8_lossy(&body);
     let fields = parse_fields(&body_str)?;
-    Ok(Some(FixMessage { begin_string: begin, fields }))
+    let raw = format!("8={}\x019={}\x01{}10={}\x01", begin, body_len, body_str, checksum);
+    Ok(Some(FixMessage { begin_string: begin, fields, raw }))
 }
 
 fn broken() -> Error {
