@@ -1,0 +1,31 @@
+[package]
+name = "rust-trader"
+version = "0.1.0"
+edition = "2021"
+description = "A financial exchange with price-time priority matching, a hand-written minimal FIX 4.4 session layer, and a read-only REST api"
+license = "GPL-2.0"
+
+[lib]
+name = "gotrader"
+path = "src/lib.rs"
+
+[[bin]]
+name = "exchange"
+path = "src/bin/exchange.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "playback"
+path = "src/bin/playback.rs"
+
+[dependencies]
+rust_decimal = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+log = "0.4"
+env_logger = "0.11"
+chrono = "0.4"

@@ -1,0 +1,20 @@
+# in a real implementation, this information would be downloaded from the exchange
+#
+# the format is:
+#
+# INSTRUMENT_ID SYMBOL
+#
+# the INSTRUMENT_ID is the numeric ID used during market data dissemination
+# the INSTRUMENT_ID and SYMBOL must be unique
+#
+
+1 IBM
+2 AAPL
+3 AMZN
+4 GOOG
+5 FB
+6 NFLX
+7 ORCL
+8 700
+9 9988
+10 1810

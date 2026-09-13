@@ -1,0 +1,275 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "rust-trader 交易所架构",
+    "quality_profile": "showcase",
+    "locale": "zh-CN",
+    "viewBox": [
+      1120,
+      610
+    ],
+    "views": [
+      {
+        "id": "order-path",
+        "label": "订单主链路",
+        "focus": [
+          "client",
+          "acceptor",
+          "engine",
+          "stats"
+        ],
+        "note": "从客户端下单到撮合与缓存更新的主路径。"
+      },
+      {
+        "id": "market-view",
+        "label": "行情查看",
+        "focus": [
+          "rest",
+          "stats",
+          "engine",
+          "console"
+        ],
+        "note": "REST 与控制台的只读查询都落在同一份进程内缓存上。"
+      },
+      {
+        "id": "replay",
+        "label": "回放模拟",
+        "focus": [
+          "playback",
+          "acceptor",
+          "engine"
+        ],
+        "note": "playback 以 MassQuote 重演历史报价，喂活整个市场。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "ext-app",
+      "type": "external",
+      "label": "自研程序",
+      "sublabel": "未来客户端",
+      "pos": [
+        60,
+        140
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "client",
+      "type": "frontend",
+      "label": "client REPL",
+      "sublabel": "下单终端",
+      "pos": [
+        60,
+        280
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "playback",
+      "type": "frontend",
+      "label": "playback",
+      "sublabel": "报价回放",
+      "pos": [
+        60,
+        415
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "acceptor",
+      "type": "backend",
+      "label": "FIX acceptor :5001",
+      "sublabel": "手写 FIX 4.2 会话层",
+      "tag": "动态会话",
+      "pos": [
+        330,
+        285
+      ],
+      "size": [
+        190,
+        88
+      ]
+    },
+    {
+      "id": "engine",
+      "type": "backend",
+      "label": "撮合引擎",
+      "sublabel": "限价 / 市价单",
+      "tag": "价格-时间优先",
+      "pos": [
+        620,
+        270
+      ],
+      "size": [
+        200,
+        100
+      ]
+    },
+    {
+      "id": "stats",
+      "type": "database",
+      "label": "book / 统计缓存",
+      "sublabel": "进程内存态",
+      "tag": "全局 sequence",
+      "pos": [
+        620,
+        100
+      ],
+      "size": [
+        200,
+        80
+      ]
+    },
+    {
+      "id": "rest",
+      "type": "backend",
+      "label": "REST :8080",
+      "sublabel": "tiny_http 只读",
+      "pos": [
+        920,
+        285
+      ],
+      "size": [
+        160,
+        88
+      ]
+    },
+    {
+      "id": "console",
+      "type": "frontend",
+      "label": "交互控制台",
+      "sublabel": "book / watch / sessions",
+      "pos": [
+        620,
+        462
+      ],
+      "size": [
+        200,
+        64
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "交易所进程 exchange.exe",
+      "wraps": [
+        "acceptor",
+        "engine",
+        "stats",
+        "rest",
+        "console"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "客户端进程",
+      "wraps": [
+        "client",
+        "playback"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "client-order",
+      "from": "client",
+      "to": "acceptor",
+      "label": "FIX 下单 D/F/G",
+      "variant": "emphasis",
+      "labelDy": 20,
+      "labelDx": 0
+    },
+    {
+      "id": "playback-quote",
+      "from": "playback",
+      "to": "acceptor",
+      "label": "MassQuote i 回放"
+    },
+    {
+      "id": "ext-fix",
+      "from": "ext-app",
+      "to": "acceptor",
+      "label": "FIX 接入 :5001",
+      "variant": "dashed"
+    },
+    {
+      "id": "acceptor-cmd",
+      "from": "acceptor",
+      "to": "engine",
+      "label": "订单 / 报价命令",
+      "labelDy": 82
+    },
+    {
+      "id": "engine-report",
+      "from": "engine",
+      "to": "acceptor",
+      "label": "ExecutionReport 8 回报",
+      "variant": "emphasis",
+      "labelDy": 52
+    },
+    {
+      "id": "engine-stats",
+      "from": "engine",
+      "to": "stats",
+      "label": "record 同步更新",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "rest-query",
+      "from": "rest",
+      "to": "stats",
+      "label": "GET /api/* 只读查询"
+    },
+    {
+      "id": "console-query",
+      "from": "console",
+      "to": "engine",
+      "label": "book / watch 查询",
+      "fromSide": "top",
+      "toSide": "bottom"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "接入",
+      "items": [
+        "FIX 4.2 acceptor :5001，动态会话、断线重置序列号",
+        "REST :8080 只读四端点（instruments / book / stats / sessions）",
+        "无持久化：进程内存态，重启即清零"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "撮合",
+      "items": [
+        "价格-时间优先连续撮合，成交价取先到方委托价",
+        "市价单以极端有效价插入，剩余数量立即撤销",
+        "改单等于撤旧挂新，时间优先级重置"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "自研底座",
+      "items": [
+        "对外契约与 Go 版等价，两版二进制可互换",
+        "纯同步线程模型，零 async（ADR-0002）",
+        "手写最小 FIX 会话层，零 C++ 依赖（ADR-0001）"
+      ]
+    }
+  ]
+}

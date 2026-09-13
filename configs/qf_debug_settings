@@ -1,0 +1,8 @@
+# client settings with quickfixgo logging enabled (diagnostics)
+BeginString=FIX.4.2
+TargetCompID=GOX
+SocketConnectHost=localhost
+SocketConnectPort=5001
+HeartBtInt=30
+ResetOnDisconnect=Y
+Logging=Y

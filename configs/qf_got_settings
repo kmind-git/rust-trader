@@ -1,0 +1,11 @@
+# FIX acceptor settings (exchange side)
+BeginString=FIX.4.2
+SenderCompID=GOX
+SocketAcceptPort=5001
+ConnectionType=acceptor
+UseDataDictionary=false
+ResetOnLogout=Y
+ResetOnDisconnect=Y
+PersistMessages=N
+Logging=N
+DynamicSessions=Y
