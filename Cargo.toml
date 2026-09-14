@@ -2,7 +2,7 @@
 name = "rust-trader"
 version = "0.1.0"
 edition = "2021"
-description = "A financial exchange with price-time priority matching, a hand-written minimal FIX 4.4 session layer, and a read-only REST api"
+description = "A financial exchange with price-time priority matching, a hand-written FIX 4.2 session layer, and a read-only REST api"
 license = "GPL-2.0"
 
 [lib]

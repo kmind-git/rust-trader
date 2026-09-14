@@ -40,55 +40,72 @@ fn to_f64(d: rust_decimal::Decimal) -> f64 {
     d.to_f64().unwrap_or(0.0)
 }
 
-/// handle one request; pure so it can be unit tested without sockets
-pub fn respond(engine: &Engine, path: &str) -> (u16, String) {
+enum Snapshot {
+    Strings(Vec<String>),
+    Book(String, Option<crate::core::orderbook::Book>),
+    Stats(String, Option<crate::core::stats::Statistics>),
+    Missing(String),
+}
+
+fn snapshot(engine: &Engine, path: &str) -> Snapshot {
     if path.starts_with("/api/instruments/") || path == "/api/instruments" {
-        let body = serde_json::to_string(&engine.all_symbols()).unwrap();
-        return (200, body);
+        return Snapshot::Strings(engine.all_symbols());
     }
-    if let Some(symbol) = path.strip_prefix("/api/book/") {
-        if symbol.is_empty() {
-            return (404, "404 page not found".to_string());
-        }
-        if engine.instrument_by_symbol(symbol).is_none() {
-            return (404, format!("the symbol {} is unknown\n", symbol));
-        }
-        let book = engine.book(symbol);
-        let dto = match book {
-            Some(book) => BookDto {
-                symbol: symbol.to_string(),
-                sequence: book.sequence,
-                bids: book
-                    .bids
-                    .iter()
-                    .map(|l| LevelDto { price: to_f64(l.price), quantity: to_f64(l.quantity) })
-                    .collect(),
-                asks: book
-                    .asks
-                    .iter()
-                    .map(|l| LevelDto { price: to_f64(l.price), quantity: to_f64(l.quantity) })
-                    .collect(),
-            },
-            None => BookDto {
-                symbol: symbol.to_string(),
-                sequence: 0,
-                bids: vec![],
-                asks: vec![],
-            },
-        };
-        return (200, serde_json::to_string(&dto).unwrap());
+    if path == "/api/sessions" {
+        return Snapshot::Strings(engine.session_ids());
     }
-    if let Some(symbol) = path.strip_prefix("/api/stats/") {
-        if symbol.is_empty() {
-            return (404, "404 page not found".to_string());
+    for (prefix, book) in [("/api/book/", true), ("/api/stats/", false)] {
+        if let Some(symbol) = path.strip_prefix(prefix) {
+            if symbol.is_empty() {
+                break;
+            }
+            if engine.instrument_by_symbol(symbol).is_none() {
+                return Snapshot::Missing(format!("the symbol {} is unknown\n", symbol));
+            }
+            return if book {
+                Snapshot::Book(symbol.into(), engine.book(symbol))
+            } else {
+                Snapshot::Stats(symbol.into(), engine.statistics(symbol))
+            };
         }
-        if engine.instrument_by_symbol(symbol).is_none() {
-            return (404, format!("the symbol {} is unknown\n", symbol));
+    }
+    Snapshot::Missing("404 page not found".into())
+}
+
+fn serialize(snapshot: Snapshot) -> (u16, String) {
+    let body = match snapshot {
+        Snapshot::Missing(message) => return (404, message),
+        Snapshot::Strings(values) => serde_json::to_string(&values).unwrap(),
+        Snapshot::Book(symbol, book) => {
+            let levels = |items: Vec<crate::core::orderbook::BookLevel>| {
+                items
+                    .into_iter()
+                    .map(|l| LevelDto {
+                        price: to_f64(l.price),
+                        quantity: to_f64(l.quantity),
+                    })
+                    .collect()
+            };
+            let dto = match book {
+                Some(book) => BookDto {
+                    symbol,
+                    sequence: book.sequence,
+                    bids: levels(book.bids),
+                    asks: levels(book.asks),
+                },
+                None => BookDto {
+                    symbol,
+                    sequence: 0,
+                    bids: vec![],
+                    asks: vec![],
+                },
+            };
+            serde_json::to_string(&dto).unwrap()
         }
-        let stats = engine.statistics(symbol);
-        let dto = match stats {
-            Some(stats) => StatsDto {
-                symbol: stats.symbol,
+        Snapshot::Stats(symbol, stats) => {
+            let stats = stats.unwrap_or_default();
+            let dto = StatsDto {
+                symbol,
                 bid_price: to_f64(stats.bid_price),
                 bid_qty: to_f64(stats.bid_qty),
                 ask_price: to_f64(stats.ask_price),
@@ -97,30 +114,23 @@ pub fn respond(engine: &Engine, path: &str) -> (u16, String) {
                 high: to_f64(stats.high),
                 low: to_f64(stats.low),
                 has_high_low: stats.has_high_low,
-            },
-            None => StatsDto {
-                symbol: symbol.to_string(),
-                bid_price: 0.0,
-                bid_qty: 0.0,
-                ask_price: 0.0,
-                ask_qty: 0.0,
-                volume: 0.0,
-                high: 0.0,
-                low: 0.0,
-                has_high_low: false,
-            },
-        };
-        return (200, serde_json::to_string(&dto).unwrap());
-    }
-    if path == "/api/sessions" {
-        let body = serde_json::to_string(&engine.session_ids()).unwrap();
-        return (200, body);
-    }
-    (404, "404 page not found".to_string())
+            };
+            serde_json::to_string(&dto).unwrap()
+        }
+    };
+    (200, body)
+}
+
+/// Compatibility helper for callers without a shared mutex.
+pub fn respond(engine: &Engine, path: &str) -> (u16, String) {
+    serialize(snapshot(engine, path))
 }
 
 /// start the REST server: one accept loop, N worker threads sharing the server
-pub fn start(engine: Arc<Mutex<Engine>>, addr: &str) -> std::io::Result<std::thread::JoinHandle<()>> {
+pub fn start(
+    engine: Arc<Mutex<Engine>>,
+    addr: &str,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     let server = Arc::new(tiny_http::Server::http(addr).map_err(std::io::Error::other)?);
     let handle = std::thread::Builder::new()
         .name("rest".to_string())
@@ -132,15 +142,16 @@ pub fn start(engine: Arc<Mutex<Engine>>, addr: &str) -> std::io::Result<std::thr
                 let worker = std::thread::Builder::new()
                     .name(format!("rest-worker-{}", i))
                     .spawn(move || loop {
-                        let mut request = match server.recv() {
+                        let request = match server.recv() {
                             Ok(request) => request,
                             Err(_) => continue,
                         };
                         let path = request.url().to_string();
-                        let (status, body) = {
+                        let data = {
                             let engine = engine.lock().unwrap();
-                            respond(&engine, &path)
+                            snapshot(&engine, &path)
                         };
+                        let (status, body) = serialize(data);
                         let content_type = if body.starts_with('{') || body.starts_with('[') {
                             "application/json"
                         } else {
@@ -149,7 +160,8 @@ pub fn start(engine: Arc<Mutex<Engine>>, addr: &str) -> std::io::Result<std::thr
                         let response = tiny_http::Response::from_string(body)
                             .with_status_code(status)
                             .with_header(
-                                tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type).unwrap(),
+                                tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type)
+                                    .unwrap(),
                             );
                         let _ = request.respond(response);
                     })
@@ -169,7 +181,7 @@ mod tests {
     use super::*;
     use crate::core::exchange::NewOrder;
     use crate::core::order::{OrderType, Side};
-    use std::sync::mpsc;
+    use crate::queue as mpsc;
 
     fn engine_with_market() -> Engine {
         let mut engine = Engine::new();
@@ -200,6 +212,21 @@ mod tests {
             )
             .unwrap();
         engine
+    }
+
+    #[test]
+    fn snapshot_survives_engine_change_and_serializes_without_lock() {
+        let shared = Mutex::new(engine_with_market());
+        let data = {
+            let engine = shared.lock().unwrap();
+            snapshot(&engine, "/api/book/IBM")
+        };
+        let mut guard = shared.try_lock().expect("snapshot must not borrow lock");
+        guard.session_disconnect("mm");
+        let (status, body) = serialize(data);
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(!json["asks"].as_array().unwrap().is_empty());
     }
 
     #[test]

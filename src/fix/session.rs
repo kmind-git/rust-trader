@@ -3,10 +3,11 @@
 //! outbound sequence number, the reader validates inbound sequence numbers and
 //! dispatches decoded messages.
 
-use std::collections::HashMap;
-use std::io::{BufReader, Write};
+use crate::queue::{self as mpsc, Sender};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -54,12 +55,19 @@ impl Signal {
 
 /// messages handed to the writer thread, which owns the outbound sequence
 /// number and does the framing
+#[derive(Debug)]
 pub enum OutMsg {
     Report(Report),
-    Message { msg_type: &'static str, fields: Vec<(u32, String)> },
+    Message {
+        msg_type: &'static str,
+        fields: Vec<(u32, String)>,
+    },
     /// sequence reset answering a ResendRequest: we persist nothing, so we
-    /// tell the counterparty to jump to our next outbound sequence
-    GapFill,
+    /// tell the counterparty to jump over the requested range
+    GapFill {
+        begin_seq: u64,
+        end_seq: u64,
+    },
     Shutdown,
 }
 
@@ -70,10 +78,118 @@ struct WriterState {
     target_comp_id: String,
     seq: u64,
     log: SessionLog,
+    wire_ids: Option<Arc<Mutex<WireIdMap>>>,
 }
 
-fn writer_loop(mut state: WriterState, rx: Receiver<OutMsg>, idle: Duration) {
+/// FIX ClOrdID is a STRING. The matching engine currently uses an i32 key, so
+/// each live connection keeps a lossless wire-to-engine mapping. Numeric IDs
+/// retain their value when possible for compatibility with the existing API.
+#[derive(Default)]
+struct WireIdMap {
+    wire_to_internal: HashMap<String, OrderId>,
+    internal_to_wire: HashMap<OrderId, String>,
+    next_internal: OrderId,
+}
+
+impl WireIdMap {
+    fn new() -> Self {
+        Self {
+            next_internal: 1,
+            ..Self::default()
+        }
+    }
+
+    fn intern(&mut self, wire: &str) -> Result<OrderId, String> {
+        if wire.is_empty() {
+            return Err("ClOrdID must not be empty".to_string());
+        }
+        if let Some(id) = self.wire_to_internal.get(wire) {
+            return Ok(*id);
+        }
+        let preferred = wire
+            .parse::<OrderId>()
+            .ok()
+            .filter(|id| *id > 0 && *id != crate::core::exchange::QUOTE_ORDER_ID);
+        let id = match preferred {
+            Some(id) if !self.internal_to_wire.contains_key(&id) => id,
+            _ => {
+                let start = self.next_internal.max(1);
+                let mut candidate = start;
+                loop {
+                    if candidate > 0
+                        && candidate != crate::core::exchange::QUOTE_ORDER_ID
+                        && !self.internal_to_wire.contains_key(&candidate)
+                    {
+                        self.next_internal = candidate.saturating_add(1).max(1);
+                        break candidate;
+                    }
+                    candidate = candidate
+                        .checked_add(1)
+                        .ok_or_else(|| "too many ClOrdIDs".to_string())?;
+                }
+            }
+        };
+        self.wire_to_internal.insert(wire.to_string(), id);
+        self.internal_to_wire.insert(id, wire.to_string());
+        Ok(id)
+    }
+
+    fn wire_for(&self, id: OrderId) -> Option<String> {
+        self.internal_to_wire.get(&id).cloned()
+    }
+}
+
+fn report_wire_id(report: &Report, ids: &Arc<Mutex<WireIdMap>>) -> Option<String> {
+    // A status generated for a cancel/replace belongs to the request's fresh
+    // ClOrdID, which is deliberately different from the order snapshot ID.
+    let order_id = match report {
+        Report::Status { cl_ord_id, .. } => *cl_ord_id,
+        Report::Fill { order, .. } => order.id,
+    };
+    ids.lock().ok().and_then(|map| map.wire_for(order_id))
+}
+
+/// `PossDupFlag(43)` and `OrigSendingTime(122)` are standard-header fields,
+/// while `frame::frame` intentionally exposes only the common header. GapFill
+/// is the one outbound message that needs them, so encode that header locally
+/// and keep all ordinary messages on the shared frame implementation.
+fn frame_gap_fill(
+    begin_string: &str,
+    msg_type: &str,
+    seq: u64,
+    sender: &str,
+    target: &str,
+    fields: &[(u32, String)],
+) -> Vec<u8> {
+    let mut body = String::new();
+    body.push_str(&format!("35={}\x01", msg_type));
+    body.push_str(&format!("34={}\x01", seq));
+    body.push_str(&format!("49={}\x01", sender));
+    body.push_str(&format!("56={}\x01", target));
+    body.push_str("43=Y\x01");
+    let timestamp = frame::utc_timestamp();
+    body.push_str(&format!("52={}\x01", timestamp));
+    body.push_str(&format!("122={}\x01", timestamp));
+    for (tag, value) in fields {
+        body.push_str(&format!("{}={}\x01", tag, value));
+    }
+    let mut message = format!("8={}\x019={}\x01", begin_string, body.len());
+    message.push_str(&body);
+    let checksum: u32 = message.bytes().map(u32::from).sum::<u32>() % 256;
+    message.push_str(&format!("10={:03}\x01", checksum));
+    message.into_bytes()
+}
+
+fn writer_loop(
+    mut state: WriterState,
+    rx: Receiver<OutMsg>,
+    idle: Duration,
+    failed: Arc<std::sync::atomic::AtomicBool>,
+) {
     loop {
+        if failed.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
         let out = match rx.recv_timeout(idle) {
             Ok(out) => out,
             Err(RecvTimeoutError::Timeout) => OutMsg::Message {
@@ -82,37 +198,85 @@ fn writer_loop(mut state: WriterState, rx: Receiver<OutMsg>, idle: Duration) {
             },
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        let (msg_type, fields) = match out {
+        let bytes = match out {
             OutMsg::Shutdown => break,
-            OutMsg::GapFill => {
-                state.seq += 1;
-                let this_seq = state.seq;
-                state.log.event(&format!("Sent SequenceReset TO: {}", this_seq + 1));
-                (
+            OutMsg::GapFill { begin_seq, end_seq } => {
+                let begin_seq = begin_seq.max(1);
+                let effective_end = if end_seq == 0 {
+                    state.seq
+                } else {
+                    end_seq.min(state.seq)
+                };
+                if begin_seq > effective_end {
+                    continue;
+                }
+                let new_seq = effective_end.saturating_add(1);
+                state.log.event(&format!(
+                    "Sent SequenceReset FROM: {} TO: {}",
+                    begin_seq, new_seq
+                ));
+                state.seq = state.seq.max(effective_end);
+                frame_gap_fill(
+                    &state.begin_string,
                     msg_type::SEQUENCE_RESET,
-                    vec![
-                        (codec::tags::NEW_SEQ_NO, (this_seq + 1).to_string()),
+                    begin_seq,
+                    &state.sender_comp_id,
+                    &state.target_comp_id,
+                    &[
+                        (codec::tags::NEW_SEQ_NO, new_seq.to_string()),
                         (codec::tags::GAP_FILL_FLAG, "Y".to_string()),
                     ],
                 )
             }
-            OutMsg::Message { msg_type, fields } => (msg_type, fields),
-            OutMsg::Report(report) => (msg_type::EXECUTION_REPORT, codec::build_execution_report(&report)),
+            OutMsg::Message { msg_type, fields } => {
+                state.seq = state.seq.saturating_add(1);
+                frame::frame(
+                    &state.begin_string,
+                    msg_type,
+                    state.seq,
+                    &state.sender_comp_id,
+                    &state.target_comp_id,
+                    &fields,
+                )
+            }
+            OutMsg::Report(report) => {
+                state.seq = state.seq.saturating_add(1);
+                let mut fields = codec::build_execution_report(&report);
+                if let Some(ids) = &state.wire_ids {
+                    for (tag, value) in &mut fields {
+                        if *tag == 41 {
+                            if let Ok(id) = value.parse::<i32>() {
+                                if let Some(wire) = ids.lock().unwrap().wire_for(id) {
+                                    *value = wire;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(wire_id) = report_wire_id(&report, ids) {
+                        if let Some((_, value)) = fields
+                            .iter_mut()
+                            .find(|(tag, _)| *tag == codec::tags::CL_ORD_ID)
+                        {
+                            *value = wire_id;
+                        }
+                    }
+                }
+                frame::frame(
+                    &state.begin_string,
+                    msg_type::EXECUTION_REPORT,
+                    state.seq,
+                    &state.sender_comp_id,
+                    &state.target_comp_id,
+                    &fields,
+                )
+            }
         };
-        state.seq += 1;
-        let bytes = frame::frame(
-            &state.begin_string,
-            msg_type,
-            state.seq,
-            &state.sender_comp_id,
-            &state.target_comp_id,
-            &fields,
-        );
         state.log.outgoing(&String::from_utf8_lossy(&bytes));
         if state.stream.write_all(&bytes).is_err() || state.stream.flush().is_err() {
             break;
         }
     }
+    let _ = state.stream.shutdown(std::net::Shutdown::Both);
 }
 
 // ---------- acceptor (exchange side) ----------
@@ -126,6 +290,7 @@ pub struct AcceptorConfig {
     /// engine-level admission (ADR-0006): quickfix's default model only
     /// accepts declared sessions; DynamicSessions=Y restores accept-all
     pub admission: Admission,
+    pub session_logs: HashMap<String, LogConfig>,
 }
 
 /// which client CompIDs may log on
@@ -151,17 +316,465 @@ fn peer_timeouts(heart_bt_int: u32) -> (Duration, Duration) {
     (heart.mul_f64(1.2), heart.mul_f64(2.4))
 }
 
+const SUPPORTED_BEGIN_STRING: &str = "FIX.4.2";
+const LOGON_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const SOCKET_POLL: Duration = Duration::from_millis(500);
+const MAX_QUEUED_MESSAGES: usize = 4096;
+
+#[derive(Default)]
+struct SequenceState {
+    expected: u64,
+    queued: BTreeMap<u64, frame::FixMessage>,
+    resend_from: Option<u64>,
+}
+
+impl SequenceState {
+    fn new(expected: u64) -> Self {
+        Self {
+            expected,
+            ..Self::default()
+        }
+    }
+
+    fn is_duplicate(msg: &frame::FixMessage) -> bool {
+        matches!(msg.get(43), Some("Y"))
+    }
+
+    /// Validate and classify an incoming message. High sequence messages are
+    /// retained until the missing range is recovered; low sequence duplicates
+    /// are accepted only when PossDupFlag=Y and are never replayed to the
+    /// application.
+    fn classify(&mut self, msg: frame::FixMessage) -> Result<SequenceAction, String> {
+        let seq = parse_required_seq(&msg)?;
+        if msg.msg_type() == Some(msg_type::SEQUENCE_RESET) {
+            let new_seq = parse_required_u64(&msg, 36)?;
+            if msg.get(123) != Some("Y")
+                || (seq < self.expected && new_seq > self.expected && Self::is_duplicate(&msg))
+            {
+                return Ok(SequenceAction::Ready(msg));
+            }
+        }
+        if seq < self.expected {
+            if Self::is_duplicate(&msg) {
+                return Ok(SequenceAction::Duplicate);
+            }
+            return Err(format!(
+                "MsgSeqNum too low, expecting {} but received {}",
+                self.expected, seq
+            ));
+        }
+        if seq > self.expected {
+            if self.queued.len() >= MAX_QUEUED_MESSAGES {
+                return Err("too many queued messages while recovering sequence gap".to_string());
+            }
+            self.queued.entry(seq).or_insert(msg);
+            let request = if self.resend_from.is_none() {
+                self.resend_from = Some(self.expected);
+                Some(self.expected)
+            } else {
+                None
+            };
+            return Ok(SequenceAction::Gap {
+                request_from: request,
+            });
+        }
+        Ok(SequenceAction::Ready(msg))
+    }
+
+    /// Advance the inbound sequence for a message whose sequence is exactly
+    /// `expected`. SequenceReset-GapFill jumps directly to NewSeqNo and does
+    /// not consume the sequence range one-by-one.
+    fn advance(&mut self, msg: &frame::FixMessage) -> Result<(), String> {
+        let seq = parse_required_seq(msg)?;
+        if seq != self.expected && msg.msg_type() != Some(msg_type::SEQUENCE_RESET) {
+            return Err(format!(
+                "internal sequence mismatch: expected {}, got {}",
+                self.expected, seq
+            ));
+        }
+        if msg.msg_type() == Some(msg_type::SEQUENCE_RESET) {
+            let new_seq = parse_required_u64(msg, codec::tags::NEW_SEQ_NO)?;
+            if new_seq <= self.expected {
+                return Err(format!(
+                    "SequenceReset NewSeqNo {} is not above {}",
+                    new_seq, self.expected
+                ));
+            }
+            self.expected = new_seq;
+            let old = std::mem::take(&mut self.queued);
+            self.queued = old.into_iter().filter(|(n, _)| *n >= new_seq).collect();
+        } else {
+            self.expected = self.expected.saturating_add(1);
+        }
+        if self.resend_from.is_some_and(|from| self.expected > from) {
+            self.resend_from = None;
+        }
+        Ok(())
+    }
+
+    fn take_ready(&mut self) -> Option<frame::FixMessage> {
+        self.queued.remove(&self.expected)
+    }
+}
+
+enum SequenceAction {
+    Ready(frame::FixMessage),
+    Gap { request_from: Option<u64> },
+    Duplicate,
+}
+
+fn parse_required_u64(msg: &frame::FixMessage, tag: u32) -> Result<u64, String> {
+    let value = msg
+        .get(tag)
+        .ok_or_else(|| format!("missing required tag {}", tag))?;
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("tag {} is not a valid positive integer", tag))?;
+    if parsed == 0 {
+        return Err(format!("tag {} must be positive", tag));
+    }
+    Ok(parsed)
+}
+
+fn parse_required_seq(msg: &frame::FixMessage) -> Result<u64, String> {
+    parse_required_u64(msg, 34)
+}
+
+fn parse_required_text(msg: &frame::FixMessage, tag: u32) -> Result<&str, String> {
+    let value = msg
+        .get(tag)
+        .ok_or_else(|| format!("missing required tag {}", tag))?;
+    if value.is_empty() {
+        return Err(format!("tag {} must not be empty", tag));
+    }
+    Ok(value)
+}
+
+fn parse_fix_timestamp(value: &str, tag: u32) -> Result<chrono::NaiveDateTime, String> {
+    let format = match value.len() {
+        17 => "%Y%m%d-%H:%M:%S",
+        21 => "%Y%m%d-%H:%M:%S%.3f",
+        _ => return Err(format!("tag {} has invalid FIX timestamp length", tag)),
+    };
+    chrono::NaiveDateTime::parse_from_str(value, format)
+        .map_err(|_| format!("tag {} is not a valid FIX timestamp", tag))
+}
+
+fn validate_timestamp_fields(msg: &frame::FixMessage) -> Result<(), String> {
+    let sending_time = parse_fix_timestamp(parse_required_text(msg, 52)?, 52)?;
+    match msg.get(43) {
+        None | Some("N") => {}
+        Some("Y") => {
+            let original = parse_fix_timestamp(parse_required_text(msg, 122)?, 122)?;
+            if original > sending_time {
+                return Err("OrigSendingTime(122) is after SendingTime(52)".to_string());
+            }
+        }
+        Some(other) => return Err(format!("PossDupFlag(43) must be Y or N, got {}", other)),
+    }
+    Ok(())
+}
+
+fn validate_unique_header_tag(msg: &frame::FixMessage, tag: u32) -> Result<&str, String> {
+    let mut values = msg
+        .fields
+        .iter()
+        .filter(|(field, _)| *field == tag)
+        .map(|(_, value)| value.as_str());
+    let value = values
+        .next()
+        .ok_or_else(|| format!("missing required tag {}", tag))?;
+    if values.next().is_some() {
+        return Err(format!("duplicate required header tag {}", tag));
+    }
+    if value.is_empty() {
+        return Err(format!("tag {} must not be empty", tag));
+    }
+    Ok(value)
+}
+
+fn validate_header(
+    msg: &frame::FixMessage,
+    begin_string: &str,
+    expected_sender: &str,
+    expected_target: &str,
+) -> Result<u64, String> {
+    if msg.begin_string != begin_string {
+        return Err(format!("unsupported BeginString {}", msg.begin_string));
+    }
+    let _ = validate_unique_header_tag(msg, 35)?;
+    let sender = validate_unique_header_tag(msg, 49)?;
+    let target = validate_unique_header_tag(msg, 56)?;
+    if sender != expected_sender || target != expected_target {
+        return Err(format!(
+            "CompID mismatch: expected {} -> {}, received {} -> {}",
+            expected_sender, expected_target, sender, target
+        ));
+    }
+    let _ = validate_unique_header_tag(msg, 34)?;
+    let _ = validate_unique_header_tag(msg, 52)?;
+    validate_timestamp_fields(msg)?;
+    parse_required_seq(msg)
+}
+
+fn validate_logon(
+    msg: &frame::FixMessage,
+    cfg: &AcceptorConfig,
+) -> Result<(String, u32, u64), String> {
+    if msg.begin_string != cfg.begin_string {
+        return Err(format!("unsupported BeginString {}", msg.begin_string));
+    }
+    if msg.msg_type() != Some(msg_type::LOGON) {
+        return Err("first message was not a Logon".to_string());
+    }
+    let sender = validate_unique_header_tag(msg, 49)?.to_string();
+    let target = validate_unique_header_tag(msg, 56)?;
+    if target != cfg.sender_comp_id {
+        return Err(format!("logon for unknown target {}", target));
+    }
+    let _ = validate_unique_header_tag(msg, 34)?;
+    let _ = validate_unique_header_tag(msg, 52)?;
+    validate_timestamp_fields(msg)?;
+    if parse_required_text(msg, codec::tags::ENCRYPT_METHOD)? != "0" {
+        return Err("only EncryptMethod=0 is supported".to_string());
+    }
+    let heart = parse_required_u64(msg, codec::tags::HEART_BT_INT)?;
+    if heart > u32::MAX as u64 {
+        return Err("HeartBtInt is too large".to_string());
+    }
+    let seq = parse_required_seq(msg)?;
+    Ok((sender, heart as u32, seq))
+}
+
+fn parse_resend_range(msg: &frame::FixMessage) -> Result<(u64, u64), String> {
+    let begin = parse_required_u64(msg, 7)?;
+    let end = msg
+        .get(16)
+        .ok_or_else(|| "missing required tag 16".to_string())?
+        .parse::<u64>()
+        .map_err(|_| "tag 16 is not a valid sequence number".to_string())?;
+    if end != 0 && end < begin {
+        return Err(format!("EndSeqNo {} is below BeginSeqNo {}", end, begin));
+    }
+    Ok((begin, end))
+}
+
+struct SessionReservation {
+    active: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for SessionReservation {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&self.id);
+        }
+    }
+}
+
+fn valid_component_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| (0x21..=0x7e).contains(&byte) && byte != b'=')
+}
+
+fn validate_acceptor_config(cfg: &AcceptorConfig) -> std::io::Result<()> {
+    if cfg.begin_string != SUPPORTED_BEGIN_STRING {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("only {} is supported", SUPPORTED_BEGIN_STRING),
+        ));
+    }
+    if cfg.port == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "acceptor port must be nonzero",
+        ));
+    }
+    if !valid_component_id(&cfg.sender_comp_id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid acceptor SenderCompID",
+        ));
+    }
+    if let Admission::Declared(targets) = &cfg.admission {
+        if targets.is_empty() || targets.iter().any(|target| !valid_component_id(target)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid declared TargetCompID",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_initiator_config(cfg: &InitiatorConfig) -> Result<(), String> {
+    if !valid_component_id(&cfg.sender_comp_id) || !valid_component_id(&cfg.target_comp_id) {
+        return Err("SenderCompID and TargetCompID must be printable ASCII IDs".to_string());
+    }
+    if cfg.host.is_empty() || cfg.port == 0 {
+        return Err("initiator host and port are required".to_string());
+    }
+    if cfg.heart_bt_int == 0 {
+        return Err("HeartBtInt must be greater than zero".to_string());
+    }
+    Ok(())
+}
+
+fn send_session_reject(
+    tx: &Sender<OutMsg>,
+    seq: Option<u64>,
+    rejected_type: Option<&str>,
+    reason: u32,
+    text: &str,
+) {
+    let mut fields = Vec::new();
+    if let Some(seq) = seq {
+        fields.push((45, seq.to_string()));
+    }
+    if let Some(msg_type) = rejected_type {
+        fields.push((372, msg_type.to_string()));
+    }
+    fields.push((373, reason.to_string()));
+    fields.push((58, text.to_string()));
+    tx.send(OutMsg::Message {
+        msg_type: msg_type::REJECT,
+        fields,
+    })
+    .ok();
+}
+
+fn send_message_reject(tx: &Sender<OutMsg>, seq: Option<u64>, rejected_type: &str, text: &str) {
+    send_session_reject(tx, seq, Some(rejected_type), 11, text);
+}
+
+fn send_session_logout(tx: &Sender<OutMsg>, text: &str) {
+    tx.send(OutMsg::Message {
+        msg_type: msg_type::LOGOUT,
+        fields: vec![(codec::tags::TEXT, text.to_string())],
+    })
+    .ok();
+}
+
+fn send_business_reject(
+    tx: &Sender<OutMsg>,
+    seq: Option<u64>,
+    rejected_type: &str,
+    reason: u32,
+    text: &str,
+) {
+    let mut fields = vec![
+        (372, rejected_type.to_string()),
+        (380, reason.to_string()),
+        (58, text.to_string()),
+    ];
+    if let Some(seq) = seq {
+        fields.insert(0, (45, seq.to_string()));
+    }
+    tx.send(OutMsg::Message {
+        msg_type: msg_type::BUSINESS_MESSAGE_REJECT,
+        fields,
+    })
+    .ok();
+}
+
+fn send_cancel_reject(
+    tx: &Sender<OutMsg>,
+    cl_ord_id: &str,
+    orig_cl_ord_id: &str,
+    response_to: &str,
+    order: Option<&crate::core::order::Order>,
+    reason: &str,
+) {
+    tx.send(OutMsg::Message {
+        msg_type: msg_type::ORDER_CANCEL_REJECT,
+        fields: vec![
+            (
+                37,
+                order
+                    .map(|o| o.exchange_id.clone())
+                    .unwrap_or_else(|| "NONE".into()),
+            ),
+            (codec::tags::CL_ORD_ID, cl_ord_id.to_string()),
+            (codec::tags::ORIG_CL_ORD_ID, orig_cl_ord_id.to_string()),
+            (434, response_to.to_string()),
+            (102, if order.is_some() { "0" } else { "1" }.to_string()),
+            (
+                codec::tags::ORD_STATUS,
+                order
+                    .map(|o| codec::ord_status_to_fix(o.state))
+                    .unwrap_or("8")
+                    .to_string(),
+            ),
+            (codec::tags::TEXT, reason.to_string()),
+        ],
+    })
+    .ok();
+}
+
+fn rejected_execution_fields(
+    cl_ord_id: &str,
+    orig_cl_ord_id: Option<&str>,
+    symbol: &str,
+    side: Side,
+    order_type: OrderType,
+    quantity: Decimal,
+    reason: &str,
+) -> Vec<(u32, String)> {
+    static NEXT_REJECT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let exec_id = format!(
+        "REJ-{}",
+        NEXT_REJECT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let mut fields = vec![
+        (codec::tags::ORDER_ID, "0".to_string()),
+        (codec::tags::EXEC_ID, exec_id),
+        (codec::tags::EXEC_TRANS_TYPE, "0".to_string()),
+        (codec::tags::EXEC_TYPE, "8".to_string()),
+        (codec::tags::ORD_STATUS, "8".to_string()),
+        (codec::tags::SIDE, codec::side_to_fix(side).to_string()),
+        (codec::tags::ORDER_QTY, codec::fix_decimal(quantity)),
+        (
+            codec::tags::ORD_TYPE,
+            if order_type == OrderType::Market {
+                "1"
+            } else {
+                "2"
+            }
+            .to_string(),
+        ),
+        (codec::tags::LEAVES_QTY, "0".to_string()),
+        (codec::tags::CUM_QTY, "0".to_string()),
+        (codec::tags::PRICE, "0".to_string()),
+        (codec::tags::CL_ORD_ID, cl_ord_id.to_string()),
+        (codec::tags::SYMBOL, symbol.to_string()),
+        (codec::tags::TEXT, reason.to_string()),
+        (codec::tags::TRANSACT_TIME, frame::utc_timestamp()),
+    ];
+    if let Some(orig) = orig_cl_ord_id {
+        fields.push((codec::tags::ORIG_CL_ORD_ID, orig.to_string()));
+    }
+    fields
+}
+
 /// blocking accept loop; spawn this on its own thread
 pub fn run_acceptor(engine: Arc<Mutex<Engine>>, cfg: AcceptorConfig) -> std::io::Result<()> {
+    validate_acceptor_config(&cfg)?;
     let listener = TcpListener::bind(("0.0.0.0", cfg.port))?;
     log::info!("FIX acceptor listening on port {}", cfg.port);
+    let active_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let engine = Arc::clone(&engine);
                 let cfg = cfg.clone();
+                let active_sessions = Arc::clone(&active_sessions);
                 std::thread::spawn(move || {
-                    if let Err(e) = handle_acceptor_connection(stream, engine, cfg) {
+                    if let Err(e) = handle_acceptor_connection(stream, engine, cfg, active_sessions)
+                    {
                         log::warn!("connection ended: {}", e);
                     }
                 });
@@ -173,306 +786,470 @@ pub fn run_acceptor(engine: Arc<Mutex<Engine>>, cfg: AcceptorConfig) -> std::io:
 }
 
 fn handle_acceptor_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     engine: Arc<Mutex<Engine>>,
     cfg: AcceptorConfig,
+    active_sessions: Arc<Mutex<HashSet<String>>>,
 ) -> std::io::Result<()> {
-    stream.set_nodelay(true).ok();
-    let mut reader = BufReader::new(stream.try_clone()?);
-    // silence is measured in the loop (1.2x/2.4x HeartBtInt), so the socket
-    // read timeout is just a coarse poll tick
-    reader.get_ref().set_read_timeout(Some(Duration::from_millis(500)))?;
-    let mut writer_stream = stream.try_clone()?;
-
-    // logon handshake: first message must be a Logon addressed to us
-    let logon = match frame::read_message(&mut reader)? {
-        Some(message) => message,
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(LOGON_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(LOGON_READ_TIMEOUT))?;
+    let mut reader = frame::FrameReader::new(stream.try_clone()?);
+    let logon = match reader.read_message()? {
+        Some(m) => m,
         None => return Ok(()),
     };
-    let client_comp_id = match logon.get(49) {
-        Some(v) => v.to_string(),
-        None => {
-            log::warn!("logon without SenderCompID (49), closing");
-            return Ok(());
-        }
+    let (client, heart, logon_seq) =
+        match validate_logon(&logon, &cfg).and_then(|v| codec::decode(&logon).map(|_| v)) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Some(peer) = logon.get(49).filter(|s| valid_component_id(s)) {
+                    let _ = stream.write_all(&frame::frame(
+                        "FIX.4.2",
+                        "5",
+                        1,
+                        &cfg.sender_comp_id,
+                        peer,
+                        &[(58, e)],
+                    ));
+                }
+                return Ok(());
+            }
+        };
+    let direct_logout = |stream: &mut TcpStream, reason: &str| {
+        let _ = stream.write_all(&frame::frame(
+            "FIX.4.2",
+            "5",
+            1,
+            &cfg.sender_comp_id,
+            &client,
+            &[(58, reason.into())],
+        ));
     };
-    // engine-level admission: undeclared clients are rejected before any
-    // session state (or log file) is created for them
-    if !client_admitted(&cfg.admission, &client_comp_id) {
-        log::warn!("FIX logon from undeclared client {}, closing", client_comp_id);
+    if !client_admitted(&cfg.admission, &client) {
+        direct_logout(&mut stream, "session not declared");
         return Ok(());
     }
-    // per-session FIX logs start with the first received message
-    let session_log = if cfg.log.enabled {
-        match SessionLog::new(&cfg.log.dir, &cfg.begin_string, &cfg.sender_comp_id, &client_comp_id) {
-            Ok(log) => log,
-            Err(e) => {
-                log::warn!("unable to create FIX logs in {}: {}", cfg.log.dir, e);
-                SessionLog::disabled()
-            }
+    if logon.get(141) == Some("Y") && logon_seq != 1 {
+        direct_logout(&mut stream, "reset Logon must have sequence 1");
+        return Ok(());
+    }
+    let session_id = format!("{}:{}->{}", cfg.begin_string, cfg.sender_comp_id, client);
+    let _reservation = {
+        let mut active = active_sessions.lock().unwrap();
+        if !active.insert(session_id.clone()) {
+            direct_logout(&mut stream, "session already active");
+            return Ok(());
         }
+        SessionReservation {
+            active: Arc::clone(&active_sessions),
+            id: session_id.clone(),
+        }
+    };
+    let log_config = cfg.session_logs.get(&client).unwrap_or(&cfg.log);
+    let session_log = if log_config.enabled {
+        SessionLog::new(
+            &log_config.dir,
+            &cfg.begin_string,
+            &cfg.sender_comp_id,
+            &client,
+        )?
     } else {
         SessionLog::disabled()
     };
     session_log.incoming(&logon.raw);
     session_log.event("Received logon request");
-    if logon.msg_type() != Some(msg_type::LOGON) {
-        log::warn!("first message was not a Logon, closing");
-        session_log.event("Failed handshake: first message was not a Logon");
-        return Ok(());
-    }
-    if logon.begin_string != cfg.begin_string {
-        log::warn!("unsupported FixVersion {}, closing", logon.begin_string);
-        session_log.event(&format!("Failed handshake: unsupported FixVersion {}", logon.begin_string));
-        return Ok(());
-    }
-    let target = match logon.get(56) {
-        Some(t) => t,
-        None => {
-            log::warn!("logon without TargetCompID (56), closing");
-            session_log.event("Failed handshake: logon without TargetCompID (56)");
-            return Ok(());
-        }
+    stream.set_read_timeout(Some(SOCKET_POLL))?;
+    let ids = Arc::new(Mutex::new(WireIdMap::new()));
+    let (tx, rx) = mpsc::channel();
+    let (report_tx, report_rx) = mpsc::channel_with_flag(mpsc::CAPACITY, tx.failure_flag());
+    engine
+        .lock()
+        .unwrap()
+        .register_session(&session_id, report_tx);
+    let writer_state = WriterState {
+        stream: stream.try_clone()?,
+        begin_string: cfg.begin_string.clone(),
+        sender_comp_id: cfg.sender_comp_id.clone(),
+        target_comp_id: client.clone(),
+        seq: 0,
+        log: session_log.clone(),
+        wire_ids: Some(ids.clone()),
     };
-    if target != cfg.sender_comp_id {
-        log::warn!("logon for unknown target {}, closing", target);
-        session_log.event(&format!("Failed handshake: logon for unknown target {}", target));
-        return Ok(());
+    let failed = tx.failure_flag();
+    let writer = std::thread::spawn(move || {
+        writer_loop(writer_state, rx, Duration::from_secs(heart as u64), failed)
+    });
+    let mut ack = codec::build_logon(heart);
+    if logon.get(141) == Some("Y") {
+        ack.push((141, "Y".into()));
     }
-    let heart_bt_int: u32 = logon.get(codec::tags::HEART_BT_INT).and_then(|v| v.parse().ok()).unwrap_or(30);
-    let (probe_after, close_after) = peer_timeouts(heart_bt_int);
-    let heart = Duration::from_secs(heart_bt_int.max(1) as u64);
-
-    let session_id = format!("{}:{}->{}", cfg.begin_string, cfg.sender_comp_id, client_comp_id);
-    let (tx, rx) = mpsc::channel::<OutMsg>();
-    let (report_tx, report_rx) = mpsc::channel::<Report>();
-    engine.lock().unwrap().register_session(&session_id, report_tx);
-    session_log.event(&format!("Created session {}", session_id));
-    {
-        // pump engine reports into the writer channel
-        let tx = tx.clone();
-        std::thread::Builder::new()
-            .name("fix-report-pump".to_string())
-            .spawn(move || {
-                for report in report_rx {
-                    if tx.send(OutMsg::Report(report)).is_err() {
-                        break;
-                    }
-                }
-            })
-            .ok();
+    let _ = tx.send(OutMsg::Message {
+        msg_type: "A",
+        fields: ack,
+    });
+    let symbols = engine.lock().unwrap().all_symbols();
+    for symbol in &symbols {
+        let id = engine
+            .lock()
+            .unwrap()
+            .instrument_by_symbol(symbol)
+            .unwrap()
+            .id;
+        let mut fields = codec::build_security_definition("bootstrap", symbol, id);
+        fields.iter_mut().find(|(t, _)| *t == 393).unwrap().1 = symbols.len().to_string();
+        let _ = tx.send(OutMsg::Message {
+            msg_type: "d",
+            fields,
+        });
     }
-
-    let begin_string = cfg.begin_string.clone();
-    let sender_comp_id = cfg.sender_comp_id.clone();
-    let writer_log = session_log.clone();
-    let writer = std::thread::Builder::new()
-        .name(format!("fix-writer-{}", client_comp_id))
-        .spawn(move || {
-            let state = WriterState {
-                stream: writer_stream,
-                begin_string,
-                sender_comp_id,
-                target_comp_id: client_comp_id,
-                seq: 0,
-                log: writer_log,
-            };
-            writer_loop(state, rx, heart.max(Duration::from_secs(5)))
-        })
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-    // logon acknowledgement
-    session_log.event("Responding to logon request");
-    tx.send(OutMsg::Message {
-        msg_type: msg_type::LOGON,
-        fields: codec::build_logon(heart_bt_int),
-    })
-    .ok();
-    log::info!("session {} logged on", session_id);
-
-    let mut expected_in: u64 = 2; // the logon consumed sequence 1
+    let mut sequence = SequenceState::new(if logon_seq == 1 { 2 } else { 1 });
+    if logon_seq > 1 {
+        sequence.queued.insert(logon_seq, logon);
+        sequence.resend_from = Some(1);
+        let _ = tx.send(OutMsg::Message {
+            msg_type: "2",
+            fields: vec![(7, "1".into()), (16, "0".into())],
+        });
+    }
+    let (probe_after, close_after) = peer_timeouts(heart);
     let mut last_received = std::time::Instant::now();
-    let mut probed = false;
+    let mut pending_test: Option<(String, std::time::Instant)> = None;
     loop {
-        match frame::read_message(&mut reader) {
-            Ok(None) => {
-                log::warn!("session {}: peer closed connection", session_id);
-                session_log.event("Connection Terminated");
-                break;
-            }
-            Ok(Some(msg)) => {
-                session_log.incoming(&msg.raw);
-                last_received = std::time::Instant::now();
-                probed = false;
-                if msg.begin_string != cfg.begin_string {
-                    session_log.event(&format!("Discarded message with BeginString {}", msg.begin_string));
-                    continue;
+        if tx.failed() {
+            session_log.event("Outbound queue overflow/disconnected; closing session");
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            break;
+        }
+        engine.lock().unwrap().expire_day_orders();
+        for report in report_rx.try_iter() {
+            let _ = tx.send(OutMsg::Report(report));
+        }
+        if pending_test
+            .as_ref()
+            .is_some_and(|(_, deadline)| std::time::Instant::now() >= *deadline)
+        {
+            send_session_logout(&tx, "TestRequest was not answered");
+            break;
+        }
+        let queued = sequence.take_ready();
+        let from_queue = queued.is_some();
+        let received = match queued {
+            Some(m) => Ok(Some(m)),
+            None => reader.read_message(),
+        };
+        let msg = match received {
+            Ok(Some(m)) => m,
+            Ok(None) => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if pending_test.is_none() && last_received.elapsed() >= probe_after {
+                    let id = format!("probe-{}", sequence.expected);
+                    let _ = tx.send(OutMsg::Message {
+                        msg_type: "1",
+                        fields: codec::build_test_request(&id),
+                    });
+                    pending_test = Some((id, std::time::Instant::now() + close_after));
                 }
-                match msg.seq() {
-                    Some(s) if s < expected_in => {
-                        log::warn!("session {}: duplicate seq {}, expected {}", session_id, s, expected_in);
-                        session_log.event(&format!("MsgSeqNum too low, expecting {} but received {}", expected_in, s));
-                        continue;
-                    }
-                    Some(s) if s > expected_in => {
-                        log::warn!(
-                            "session {}: seq gap (got {}, expected {}), requesting resend",
-                            session_id, s, expected_in
-                        );
-                        session_log.event(&format!("MsgSeqNum too high, expecting {} but received {}", expected_in, s));
-                        tx.send(OutMsg::Message {
-                            msg_type: msg_type::RESEND_REQUEST,
-                            fields: vec![(7, expected_in.to_string()), (16, "0".to_string())],
-                        })
-                        .ok();
-                        session_log.event(&format!("Sent ResendRequest FROM: {} TO: {}", expected_in, 0));
-                        continue;
-                    }
-                    _ => {}
-                }
-                expected_in += 1;
-
-                let decoded = match codec::decode(&msg) {
-                    Ok(decoded) => decoded,
-                    Err(e) => {
-                        log::warn!("session {}: bad message: {}", session_id, e);
-                        session_log.event(&format!("Msg Parse Error: {}", e));
-                        continue;
-                    }
-                };
-                match decoded {
-                    Inbound::Heartbeat => {}
-                    Inbound::TestRequest { test_req_id } => {
-                        tx.send(OutMsg::Message {
-                            msg_type: msg_type::HEARTBEAT,
-                            fields: codec::build_heartbeat(Some(&test_req_id)),
-                        })
-                        .ok();
-                    }
-                    Inbound::ResendRequest => {
-                        session_log.event("Received ResendRequest");
-                        tx.send(OutMsg::GapFill).ok();
-                    }
-                    Inbound::Logout => {
-                        session_log.event("Received logout request");
-                        tx.send(OutMsg::Message { msg_type: msg_type::LOGOUT, fields: vec![] }).ok();
-                        session_log.event("Sending logout response");
-                        break;
-                    }
-                    Inbound::Logon { .. } => {
-                        log::warn!("session {}: duplicate logon ignored", session_id);
-                        session_log.event("Received duplicate logon request");
-                    }
-                    Inbound::Unsupported(t) => {
-                        log::warn!("session {}: unsupported msg type {}", session_id, t);
-                        session_log.event(&format!("Unsupported message type {}", t));
-                    }
-                    inbound => {
-                        let mut engine = engine.lock().unwrap();
-                        handle_business(&mut engine, &session_id, &tx, inbound);
-                    }
-                }
+                continue;
             }
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
-                    let silent = last_received.elapsed();
-                    if silent >= close_after {
-                        log::warn!("session {}: no data for {}s, closing", session_id, silent.as_secs());
-                        session_log.event("Session Timeout");
-                        break;
-                    }
-                    if silent >= probe_after && !probed {
-                        tx.send(OutMsg::Message {
-                            msg_type: msg_type::TEST_REQUEST,
-                            fields: codec::build_test_request("ARE-YOU-THERE"),
-                        })
-                        .ok();
-                        session_log.event("Sent test request");
-                        probed = true;
-                    }
-                    continue;
-                }
-                log::warn!("session {}: read error: {} (kind {:?})", session_id, e, e.kind());
-                session_log.event(&format!("Connection Terminated: {}", e));
+                session_log.incoming_bytes(reader.buffered_bytes());
+                session_log.event(&e.to_string());
                 break;
             }
+        };
+        if !from_queue {
+            session_log.incoming(&msg.raw);
+            last_received = std::time::Instant::now();
+        }
+        if let Err(e) = validate_header(&msg, &cfg.begin_string, &client, &cfg.sender_comp_id) {
+            send_session_logout(&tx, &e);
+            break;
+        }
+        let msg = match sequence.classify(msg) {
+            Ok(SequenceAction::Ready(m)) => m,
+            Ok(SequenceAction::Duplicate) => continue,
+            Ok(SequenceAction::Gap { request_from }) => {
+                if let Some(n) = request_from {
+                    let _ = tx.send(OutMsg::Message {
+                        msg_type: "2",
+                        fields: vec![(7, n.to_string()), (16, "0".into())],
+                    });
+                }
+                continue;
+            }
+            Err(e) => {
+                send_session_logout(&tx, &e);
+                break;
+            }
+        };
+        let decoded = codec::decode(&msg);
+        // Invalid messages consume their sequence but must not modify the
+        // recovery cursor using unvalidated SequenceReset fields.
+        if decoded.is_err() {
+            sequence.expected += 1;
+            let reason = decoded.unwrap_err();
+            send_session_reject(&tx, msg.seq(), msg.msg_type(), 5, &reason);
+            continue;
+        }
+        if let Err(e) = sequence.advance(&msg) {
+            send_session_logout(&tx, &e);
+            break;
+        }
+        if msg.msg_type() == Some("0")
+            && pending_test
+                .as_ref()
+                .is_some_and(|(id, _)| msg.get(112) == Some(id))
+        {
+            pending_test = None;
+        }
+        match decoded.unwrap() {
+            Inbound::Heartbeat | Inbound::SequenceReset { .. } => {}
+            Inbound::TestRequest { test_req_id } => {
+                let _ = tx.send(OutMsg::Message {
+                    msg_type: "0",
+                    fields: codec::build_heartbeat(Some(&test_req_id)),
+                });
+            }
+            Inbound::ResendRequest => {
+                let (begin_seq, end_seq) = parse_resend_range(&msg).unwrap();
+                let _ = tx.send(OutMsg::GapFill { begin_seq, end_seq });
+            }
+            Inbound::Logout => {
+                let _ = tx.send(OutMsg::Message {
+                    msg_type: "5",
+                    fields: vec![],
+                });
+                break;
+            }
+            Inbound::Logon { .. } if logon_seq > 1 && msg.seq() == Some(logon_seq) => {}
+            Inbound::SessionReject { reason } | Inbound::BusinessReject { reason } => {
+                session_log.event(&reason)
+            }
+            Inbound::Unsupported(kind) => {
+                if matches!(kind.as_str(), "c" | "H" | "V" | "R" | "a" | "e" | "g") {
+                    send_business_reject(
+                        &tx,
+                        msg.seq(),
+                        &kind,
+                        3,
+                        "message not supported by this profile",
+                    );
+                } else {
+                    send_message_reject(&tx, msg.seq(), &kind, "invalid or unsupported MsgType");
+                }
+            }
+            inbound @ (Inbound::NewOrderSingle { .. }
+            | Inbound::CancelRequest { .. }
+            | Inbound::CancelReplace { .. }
+            | Inbound::MassQuote { .. }) => {
+                handle_business(
+                    &mut engine.lock().unwrap(),
+                    &session_id,
+                    &tx,
+                    inbound,
+                    &ids,
+                    msg.seq(),
+                );
+            }
+            _ => send_business_reject(
+                &tx,
+                msg.seq(),
+                msg.msg_type().unwrap(),
+                3,
+                "message not accepted in this direction",
+            ),
         }
     }
     engine.lock().unwrap().session_disconnect(&session_id);
-    session_log.event("Disconnected");
-    log::info!("session {} disconnected", session_id);
-    drop(tx);
+    for report in report_rx.try_iter() {
+        let _ = tx.send(OutMsg::Report(report));
+    }
+    let _ = tx.send(OutMsg::Shutdown);
     let _ = writer.join();
+    session_log.event("Disconnected");
     Ok(())
 }
 
-/// FIX 4.2 has no SessionReject; business-level problems go out as a
-/// BusinessMessageReject (j) with the reason in Text (58)
-fn reject_business(tx: &Sender<OutMsg>, reason: &str) {
-    tx.send(OutMsg::Message {
-        msg_type: msg_type::BUSINESS_MESSAGE_REJECT,
-        fields: vec![(58, reason.to_string())],
-    })
-    .ok();
+fn fresh_id(ids: &Arc<Mutex<WireIdMap>>, wire: &str) -> Result<i32, String> {
+    let mut ids = ids.lock().unwrap();
+    if ids.wire_to_internal.contains_key(wire) {
+        return Err("duplicate ClOrdID".into());
+    }
+    ids.intern(wire)
 }
 
-/// apply a business message to the engine
-fn handle_business(engine: &mut Engine, session_id: &str, tx: &Sender<OutMsg>, inbound: Inbound) {
+fn handle_business(
+    engine: &mut Engine,
+    session: &str,
+    tx: &Sender<OutMsg>,
+    inbound: Inbound,
+    ids: &Arc<Mutex<WireIdMap>>,
+    _seq: Option<u64>,
+) {
     match inbound {
-        Inbound::NewOrderSingle { cl_ord_id, symbol, side, order_type, price, quantity } => {
-            let instrument_id = match engine.instrument_by_symbol(&symbol) {
-                Some(instrument) => instrument.id,
-                None => {
-                    log::warn!("unknown symbol {}", symbol);
-                    reject_business(tx, &format!("unknown symbol {}", symbol));
-                    return;
-                }
-            };
-            if let Err(e) = engine.create_order(
-                session_id,
-                NewOrder { id: cl_ord_id, instrument_id, side, order_type, price, quantity },
-            ) {
-                log::warn!("create order failed: {}", e);
-            }
-        }
-        Inbound::CancelRequest { cl_ord_id, orig_cl_ord_id } => {
-            // spec-style clients send a fresh ClOrdID (11) and point OrigClOrdID
-            // (41) at the order; Go-style clients reuse the order id in 11
-            let result = engine.cancel_order(session_id, cl_ord_id).or_else(|e| {
-                if orig_cl_ord_id != cl_ord_id {
-                    engine.cancel_order(session_id, orig_cl_ord_id)
-                } else {
-                    Err(e)
-                }
-            });
+        Inbound::NewOrderSingle {
+            cl_ord_id,
+            symbol,
+            side,
+            order_type,
+            price,
+            quantity,
+        } => {
+            let result = (|| {
+                let id = fresh_id(ids, &cl_ord_id)?;
+                let instrument_id = engine
+                    .instrument_by_symbol(&symbol)
+                    .ok_or("unknown symbol")?
+                    .id;
+                engine
+                    .create_order(
+                        session,
+                        NewOrder {
+                            id,
+                            instrument_id,
+                            side,
+                            order_type,
+                            price,
+                            quantity,
+                        },
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok::<(), String>(())
+            })();
             if let Err(e) = result {
-                log::warn!("cancel order failed: {}", e);
-            }
-        }
-        Inbound::CancelReplace { cl_ord_id, orig_cl_ord_id, price, quantity } => {
-            if let Err(e) = engine.modify_order(session_id, orig_cl_ord_id, cl_ord_id, price, quantity) {
-                log::warn!("modify order failed: {}", e);
-            }
-        }
-        Inbound::MassQuote { quote_id, ack, symbol, bid_px, bid_qty, offer_px, offer_qty } => {
-            let instrument_id = match engine.instrument_by_symbol(&symbol) {
-                Some(instrument) => instrument.id,
-                None => {
-                    log::warn!("unknown symbol {}", symbol);
-                    reject_business(tx, &format!("unknown symbol {}", symbol));
-                    return;
+                let mut fields = rejected_execution_fields(
+                    &cl_ord_id, None, &symbol, side, order_type, quantity, &e,
+                );
+                fields.push((6, "0".into()));
+                if let Some((_, v)) = fields.iter_mut().find(|(t, _)| *t == 44) {
+                    *v = codec::fix_decimal(price);
                 }
-            };
-            if let Err(e) = engine.quote(session_id, instrument_id, bid_px, bid_qty, offer_px, offer_qty) {
-                log::warn!("quote failed: {}", e);
-                return;
+                let _ = tx.send(OutMsg::Message {
+                    msg_type: "8",
+                    fields,
+                });
             }
-            if ack {
-                tx.send(OutMsg::Message {
-                    msg_type: msg_type::MASS_QUOTE_ACKNOWLEDGEMENT,
-                    fields: codec::build_mass_quote_ack(&quote_id),
-                })
-                .ok();
+        }
+        Inbound::CancelRequest {
+            cl_ord_id,
+            orig_cl_ord_id,
+            symbol,
+            side,
+        } => {
+            let result = (|| {
+                let request = fresh_id(ids, &cl_ord_id)?;
+                let original = *ids
+                    .lock()
+                    .unwrap()
+                    .wire_to_internal
+                    .get(&orig_cl_ord_id)
+                    .ok_or("unknown original ClOrdID")?;
+                let order = engine.order(session, original).ok_or("unknown order")?;
+                let instrument = engine
+                    .instrument_by_symbol(&symbol)
+                    .ok_or("unknown symbol")?;
+                if order.side != side || order.instrument_id != instrument.id {
+                    return Err("symbol/side differs from original order".into());
+                }
+                engine
+                    .cancel_order_with_id(session, original, request)
+                    .map_err(|e| e.to_string())
+            })();
+            if let Err(e) = result {
+                send_cancel_reject(
+                    tx,
+                    &cl_ord_id,
+                    &orig_cl_ord_id,
+                    "1",
+                    ids.lock()
+                        .unwrap()
+                        .wire_to_internal
+                        .get(&orig_cl_ord_id)
+                        .copied()
+                        .and_then(|id| engine.order(session, id)),
+                    &e,
+                );
+            }
+        }
+        Inbound::CancelReplace {
+            cl_ord_id,
+            orig_cl_ord_id,
+            symbol,
+            side,
+            order_type,
+            price,
+            quantity,
+        } => {
+            let result = (|| {
+                let request = fresh_id(ids, &cl_ord_id)?;
+                let original = *ids
+                    .lock()
+                    .unwrap()
+                    .wire_to_internal
+                    .get(&orig_cl_ord_id)
+                    .ok_or("unknown original ClOrdID")?;
+                let order = engine.order(session, original).ok_or("unknown order")?;
+                let instrument = engine
+                    .instrument_by_symbol(&symbol)
+                    .ok_or("unknown symbol")?;
+                if order.side != side || order.instrument_id != instrument.id {
+                    return Err("symbol/side differs from original order".into());
+                }
+                engine
+                    .modify_order_with_type(session, original, request, order_type, price, quantity)
+                    .map_err(|e| e.to_string())
+            })();
+            if let Err(e) = result {
+                send_cancel_reject(
+                    tx,
+                    &cl_ord_id,
+                    &orig_cl_ord_id,
+                    "2",
+                    ids.lock()
+                        .unwrap()
+                        .wire_to_internal
+                        .get(&orig_cl_ord_id)
+                        .copied()
+                        .and_then(|id| engine.order(session, id)),
+                    &e,
+                );
+            }
+        }
+        Inbound::MassQuote {
+            quote_id,
+            response_level,
+            symbol,
+            bid_px,
+            bid_qty,
+            offer_px,
+            offer_qty,
+        } => {
+            let result = engine
+                .instrument_by_symbol(&symbol)
+                .map(|i| i.id)
+                .ok_or_else(|| "unknown symbol".to_string())
+                .and_then(|id| {
+                    engine
+                        .quote(session, id, bid_px, bid_qty, offer_px, offer_qty)
+                        .map_err(|e| e.to_string())
+                });
+            if response_level == 2 || (response_level == 1 && result.is_err()) {
+                let mut fields = codec::build_mass_quote_ack(&quote_id);
+                if let Err(e) = result {
+                    fields.iter_mut().find(|(t, _)| *t == 297).unwrap().1 = "5".into();
+                    fields.push((300, "8".into()));
+                    fields.push((58, e));
+                }
+                let _ = tx.send(OutMsg::Message {
+                    msg_type: "b",
+                    fields,
+                });
             }
         }
         _ => {}
@@ -515,6 +1292,8 @@ pub trait Callback: Send {
 struct InitiatorShared {
     logged_in: Signal,
     connected: Signal,
+    logout_requested: Signal,
+    logged_out: Signal,
     callback: Mutex<Box<dyn Callback + Send>>,
     orders: Mutex<HashMap<OrderId, OrderView>>,
     instruments: Mutex<crate::core::instrument::InstrumentMap>,
@@ -534,6 +1313,9 @@ pub struct Initiator {
     shared: Arc<InitiatorShared>,
     cmd_tx: Sender<OutMsg>,
     next_order: Mutex<i32>,
+    control: TcpStream,
+    reader_thread: Option<std::thread::JoinHandle<()>>,
+    writer_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -552,166 +1334,94 @@ impl std::fmt::Display for ConnectError {
 }
 
 impl Initiator {
-    /// connect, log on (blocking up to 30s), and start the session threads
-    pub fn connect(cfg: InitiatorConfig, callback: Box<dyn Callback + Send>) -> Result<Initiator, ConnectError> {
-        let session_log = if cfg.log.enabled {
-            match SessionLog::new(&cfg.log.dir, "FIX.4.2", &cfg.sender_comp_id, &cfg.target_comp_id) {
-                Ok(log) => log,
-                Err(e) => {
-                    log::warn!("unable to create FIX logs in {}: {}", cfg.log.dir, e);
-                    SessionLog::disabled()
-                }
-            }
+    /// Connect using the supported fresh-session / non-persistent profile.
+    pub fn connect(
+        cfg: InitiatorConfig,
+        callback: Box<dyn Callback + Send>,
+    ) -> Result<Initiator, ConnectError> {
+        validate_initiator_config(&cfg).map_err(|e| {
+            ConnectError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+        let log = if cfg.log.enabled {
+            SessionLog::new(
+                &cfg.log.dir,
+                "FIX.4.2",
+                &cfg.sender_comp_id,
+                &cfg.target_comp_id,
+            )
+            .map_err(ConnectError::Io)?
         } else {
             SessionLog::disabled()
         };
-        session_log.event(&format!("Connecting to: {}:{}", cfg.host, cfg.port));
-        let stream = match TcpStream::connect((cfg.host.as_str(), cfg.port)) {
-            Ok(stream) => stream,
-            Err(e) => {
-                session_log.event(&format!("Failed to connect: {}", e));
-                return Err(ConnectError::Io(e));
-            }
-        };
-        stream.set_nodelay(true).ok();
-        let mut reader_stream = stream.try_clone().map_err(ConnectError::Io)?;
-        reader_stream.set_read_timeout(Some(Duration::from_secs(90))).ok();
-        let mut reader = BufReader::new(reader_stream);
-        let writer_stream = stream.try_clone().map_err(ConnectError::Io)?;
-        let (cmd_tx, cmd_rx) = mpsc::channel::<OutMsg>();
-
+        let stream = TcpStream::connect((cfg.host.as_str(), cfg.port)).map_err(ConnectError::Io)?;
+        stream.set_nodelay(true).map_err(ConnectError::Io)?;
+        stream
+            .set_read_timeout(Some(SOCKET_POLL))
+            .map_err(ConnectError::Io)?;
+        stream
+            .set_write_timeout(Some(LOGON_READ_TIMEOUT))
+            .map_err(ConnectError::Io)?;
+        let reader = frame::FrameReader::new(stream.try_clone().map_err(ConnectError::Io)?);
+        let (tx, rx) = mpsc::channel();
         let shared = Arc::new(InitiatorShared {
             logged_in: Signal::new(),
             connected: Signal::new(),
+            logout_requested: Signal::new(),
+            logged_out: Signal::new(),
             callback: Mutex::new(callback),
             orders: Mutex::new(HashMap::new()),
             instruments: Mutex::new(crate::core::instrument::InstrumentMap::new()),
-            log: session_log.clone(),
+            log: log.clone(),
         });
-
-        // writer thread
-        {
-            let state = WriterState {
-                stream: writer_stream,
-                begin_string: "FIX.4.2".to_string(),
-                sender_comp_id: cfg.sender_comp_id.clone(),
-                target_comp_id: cfg.target_comp_id.clone(),
-                seq: 0,
-                log: session_log.clone(),
-            };
-            let idle = Duration::from_secs(cfg.heart_bt_int.max(5) as u64);
-            std::thread::Builder::new()
-                .name("fix-writer".to_string())
-                .spawn(move || writer_loop(state, cmd_rx, idle))
-                .map_err(ConnectError::Io)?;
-        }
-
-        // reader thread
-        {
-            let shared = Arc::clone(&shared);
-            // inbound messages are addressed to us: 56 must be our SenderCompID
-            let expected_target = cfg.sender_comp_id.clone();
-            let mut shutdown = cmd_tx.clone();
-            std::thread::Builder::new()
-                .name("fix-reader".to_string())
-                .spawn(move || {
-                    let mut expected_in: u64 = 1;
-                    loop {
-                        let message = match frame::read_message(&mut reader) {
-                            Ok(Some(message)) => message,
-                            Ok(None) => {
-                                shared.log.event("Connection Terminated");
-                                break;
-                            }
-                            Err(_) => {
-                                shared.log.event("Session Timeout");
-                                break;
-                            }
-                        };
-                        shared.log.incoming(&message.raw);
-                        if message.get(56).map(|v| v != expected_target).unwrap_or(false) {
-                            continue;
-                        }
-                        match message.seq() {
-                            Some(s) if s < expected_in => {
-                                log::warn!("duplicate seq {}", s);
-                                shared.log.event(&format!("MsgSeqNum too low, expecting {} but received {}", expected_in, s));
-                                continue;
-                            }
-                            Some(s) if s > expected_in => {
-                                log::warn!("seq gap (got {}, expected {})", s, expected_in);
-                                shared.log.event(&format!("MsgSeqNum too high, expecting {} but received {} (processing anyway)", expected_in, s));
-                                // process anyway: as a client we can't afford to stall
-                            }
-                            _ => {}
-                        }
-                        expected_in = message.seq().map(|s| s + 1).unwrap_or(expected_in);
-                        let decoded = match codec::decode(&message) {
-                            Ok(decoded) => decoded,
-                            Err(e) => {
-                                log::warn!("bad message: {}", e);
-                                shared.log.event(&format!("Msg Parse Error: {}", e));
-                                continue;
-                            }
-                        };
-                        match decoded {
-                            Inbound::Logon { .. } => {
-                                shared.log.event("Received logon response");
-                                shared.log.event("In session");
-                                shared.logged_in.set();
-                            }
-                            Inbound::Logout => {
-                                shared.log.event("Received logout request");
-                                log::info!("we are logged out!");
-                                shared.logged_in.reset();
-                                break;
-                            }
-                            Inbound::Heartbeat => {}
-                            Inbound::TestRequest { test_req_id } => {
-                                shutdown
-                                    .send(OutMsg::Message {
-                                        msg_type: msg_type::HEARTBEAT,
-                                        fields: codec::build_heartbeat(Some(&test_req_id)),
-                                    })
-                                    .ok();
-                            }
-                            Inbound::ResendRequest => { shutdown.send(OutMsg::GapFill).ok(); }
-                            Inbound::SecurityDefinition { symbol, instrument_id, .. } => {
-                                let instrument = Instrument::new(instrument_id, &symbol);
-                                shared.instruments.lock().unwrap().put(instrument.clone());
-                                shared.callback.lock().unwrap().on_instrument(&instrument);
-                            }
-                            Inbound::ExecutionReport(data) => {
-                                handle_execution_report(&shared, data);
-                            }
-                            _ => {}
-                        }
-                    }
-                    shared.logged_in.reset();
-                    shared.connected.reset();
-                    shared.log.event("Disconnected");
-                    let _ = shutdown.send(OutMsg::Shutdown);
-                })
-                .map_err(ConnectError::Io)?;
-        }
-
-        let initiator = Initiator {
-            shared,
-            cmd_tx,
-            next_order: Mutex::new(0),
+        shared.connected.set();
+        let writer_state = WriterState {
+            stream: stream.try_clone().map_err(ConnectError::Io)?,
+            begin_string: "FIX.4.2".into(),
+            sender_comp_id: cfg.sender_comp_id.clone(),
+            target_comp_id: cfg.target_comp_id.clone(),
+            seq: 0,
+            log,
+            wire_ids: None,
         };
-        // log on and wait
-        session_log.event("Sending logon request");
-        initiator
-            .cmd_tx
-            .send(OutMsg::Message { msg_type: msg_type::LOGON, fields: codec::build_logon(cfg.heart_bt_int) })
-            .map_err(|_| ConnectError::Timeout)?;
-        if !initiator.shared.logged_in.wait_for(Duration::from_secs(30)) {
-            session_log.event("Timed out waiting for logon response");
+        let heart = cfg.heart_bt_int;
+        let failed = tx.failure_flag();
+        let writer_thread = std::thread::spawn(move || {
+            writer_loop(writer_state, rx, Duration::from_secs(heart as u64), failed)
+        });
+        let reader_shared = shared.clone();
+        let reader_tx = tx.clone();
+        let reader_thread =
+            std::thread::spawn(move || initiator_reader(reader, reader_shared, reader_tx, cfg));
+        let _ = tx.send(OutMsg::Message {
+            msg_type: "A",
+            fields: codec::build_logon(heart),
+        });
+        let mut initiator = Initiator {
+            shared,
+            cmd_tx: tx,
+            next_order: Mutex::new(0),
+            control: stream,
+            reader_thread: Some(reader_thread),
+            writer_thread: Some(writer_thread),
+        };
+        if !initiator.shared.logged_in.wait_for(LOGON_READ_TIMEOUT) {
+            initiator.stop_threads();
             return Err(ConnectError::Timeout);
         }
-        initiator.shared.connected.set();
         Ok(initiator)
+    }
+
+    fn stop_threads(&mut self) {
+        let _ = self.cmd_tx.send(OutMsg::Shutdown);
+        let _ = self.control.shutdown(std::net::Shutdown::Both);
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.writer_thread.take() {
+            let _ = handle.join();
+        }
+        self.shared.connected.reset();
+        self.shared.logged_in.reset();
     }
 
     pub fn is_connected(&self) -> bool {
@@ -728,19 +1438,17 @@ impl Initiator {
             .map(|i| i.id)
     }
 
-    /// graceful disconnect: Logout then Shutdown flow through the same FIFO
-    /// channel as order traffic, so pending messages are flushed first
+    /// Wait for the peer's Logout; close only after its response or deadline.
     pub fn disconnect(&mut self) {
-        if self.shared.connected.get() {
-            self.shared.log.event("Initiated logout request");
-            self.cmd_tx
-                .send(OutMsg::Message { msg_type: msg_type::LOGOUT, fields: codec::build_logout() })
-                .ok();
+        if self.shared.connected.get() && !self.shared.logout_requested.get() {
+            self.shared.logout_requested.set();
+            let _ = self.cmd_tx.send(OutMsg::Message {
+                msg_type: "5",
+                fields: vec![],
+            });
+            self.shared.logged_out.wait_for(LOGON_READ_TIMEOUT);
         }
-        self.cmd_tx.send(OutMsg::Shutdown).ok();
-        self.shared.logged_in.reset();
-        self.shared.connected.reset();
-        std::thread::sleep(Duration::from_millis(150));
+        self.stop_threads();
     }
 
     fn require_connected(&self) -> Result<(), ()> {
@@ -786,7 +1494,10 @@ impl Initiator {
             quantity,
         );
         self.cmd_tx
-            .send(OutMsg::Message { msg_type: msg_type::NEW_ORDER_SINGLE, fields })
+            .send(OutMsg::Message {
+                msg_type: msg_type::NEW_ORDER_SINGLE,
+                fields,
+            })
             .map_err(|_| ())?;
         Ok(id)
     }
@@ -822,10 +1533,19 @@ impl Initiator {
                 },
             );
         }
-        let fields =
-            codec::build_cancel_replace(&id.to_string(), &req_id.to_string(), &symbol, side, price, quantity);
+        let fields = codec::build_cancel_replace(
+            &id.to_string(),
+            &req_id.to_string(),
+            &symbol,
+            side,
+            price,
+            quantity,
+        );
         self.cmd_tx
-            .send(OutMsg::Message { msg_type: msg_type::ORDER_CANCEL_REPLACE_REQUEST, fields })
+            .send(OutMsg::Message {
+                msg_type: msg_type::ORDER_CANCEL_REPLACE_REQUEST,
+                fields,
+            })
             .map_err(|_| ())
     }
 
@@ -842,9 +1562,17 @@ impl Initiator {
             *next_order += 1;
             *next_order
         };
-        let fields = codec::build_cancel_request(&id.to_string(), &req_id.to_string(), &record.symbol, record.side);
+        let fields = codec::build_cancel_request(
+            &id.to_string(),
+            &req_id.to_string(),
+            &record.symbol,
+            record.side,
+        );
         self.cmd_tx
-            .send(OutMsg::Message { msg_type: msg_type::ORDER_CANCEL_REQUEST, fields })
+            .send(OutMsg::Message {
+                msg_type: msg_type::ORDER_CANCEL_REQUEST,
+                fields,
+            })
             .map_err(|_| ())
     }
 
@@ -857,51 +1585,357 @@ impl Initiator {
         ask_quantity: Decimal,
     ) -> Result<(), ()> {
         self.require_connected().map_err(|_| ())?;
-        let fields = codec::build_mass_quote(symbol, bid_price, bid_quantity, ask_price, ask_quantity);
-        self.cmd_tx.send(OutMsg::Message { msg_type: msg_type::MASS_QUOTE, fields }).map_err(|_| ())
+        let fields =
+            codec::build_mass_quote(symbol, bid_price, bid_quantity, ask_price, ask_quantity);
+        self.cmd_tx
+            .send(OutMsg::Message {
+                msg_type: msg_type::MASS_QUOTE,
+                fields,
+            })
+            .map_err(|_| ())
     }
 }
 
-fn handle_execution_report(shared: &InitiatorShared, data: crate::fix::codec::ExecReportData) {
-    let is_quote = data.exchange_id.starts_with("quote.");
-    let id = if is_quote { 0 } else { data.cl_ord_id };
+impl Drop for Initiator {
+    fn drop(&mut self) {
+        self.stop_threads();
+    }
+}
 
-    let mut order_view: Option<OrderView> = None;
+fn initiator_reader(
+    mut reader: frame::FrameReader<TcpStream>,
+    shared: Arc<InitiatorShared>,
+    tx: Sender<OutMsg>,
+    cfg: InitiatorConfig,
+) {
+    let mut sequence = SequenceState::new(1);
+    let started = std::time::Instant::now();
+    let mut first = true;
+    let mut last_received = started;
+    let (probe_after, close_after) = peer_timeouts(cfg.heart_bt_int);
+    let mut pending: Option<(String, std::time::Instant)> = None;
+    loop {
+        if tx.failed() {
+            break;
+        }
+        if !shared.logged_in.get() && started.elapsed() >= LOGON_READ_TIMEOUT {
+            break;
+        }
+        if pending
+            .as_ref()
+            .is_some_and(|(_, deadline)| std::time::Instant::now() >= *deadline)
+        {
+            send_session_logout(&tx, "TestRequest timeout");
+            break;
+        }
+        let queued = sequence.take_ready();
+        let from_queue = queued.is_some();
+        let received = match queued {
+            Some(m) => Ok(Some(m)),
+            None => reader.read_message(),
+        };
+        let msg = match received {
+            Ok(Some(m)) => m,
+            Ok(None) => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if shared.logged_in.get()
+                    && !shared.logout_requested.get()
+                    && pending.is_none()
+                    && last_received.elapsed() >= probe_after
+                {
+                    let id = format!("client-probe-{}", sequence.expected);
+                    let _ = tx.send(OutMsg::Message {
+                        msg_type: "1",
+                        fields: codec::build_test_request(&id),
+                    });
+                    pending = Some((id, std::time::Instant::now() + close_after));
+                }
+                continue;
+            }
+            Err(e) => {
+                shared.log.incoming_bytes(reader.buffered_bytes());
+                shared.log.event(&e.to_string());
+                break;
+            }
+        };
+        if !from_queue {
+            shared.log.incoming(&msg.raw);
+            last_received = std::time::Instant::now();
+        }
+        if let Err(e) = validate_header(&msg, "FIX.4.2", &cfg.target_comp_id, &cfg.sender_comp_id) {
+            send_session_logout(&tx, &e);
+            break;
+        }
+        if first {
+            if !matches!(msg.msg_type(), Some("A" | "5")) {
+                send_session_logout(&tx, "expected Logon response");
+                break;
+            }
+            first = false;
+        }
+        let msg = match sequence.classify(msg) {
+            Ok(SequenceAction::Ready(m)) => m,
+            Ok(SequenceAction::Duplicate) => continue,
+            Ok(SequenceAction::Gap { request_from }) => {
+                if let Some(n) = request_from {
+                    let _ = tx.send(OutMsg::Message {
+                        msg_type: "2",
+                        fields: vec![(7, n.to_string()), (16, "0".into())],
+                    });
+                }
+                continue;
+            }
+            Err(e) => {
+                send_session_logout(&tx, &e);
+                break;
+            }
+        };
+        let decoded = match codec::decode(&msg) {
+            Ok(v) => v,
+            Err(e) => {
+                sequence.expected += 1;
+                send_session_reject(&tx, msg.seq(), msg.msg_type(), 5, &e);
+                continue;
+            }
+        };
+        if let Err(e) = sequence.advance(&msg) {
+            send_session_logout(&tx, &e);
+            break;
+        }
+        if msg.msg_type() == Some("0")
+            && pending
+                .as_ref()
+                .is_some_and(|(id, _)| msg.get(112) == Some(id))
+        {
+            pending = None;
+        }
+        match decoded {
+            Inbound::Logon { heart_bt_int } => {
+                if shared.logged_in.get() || heart_bt_int != cfg.heart_bt_int {
+                    send_session_logout(&tx, "unexpected Logon or HeartBtInt");
+                    break;
+                }
+                shared.logged_in.set();
+            }
+            Inbound::Logout => {
+                if !shared.logout_requested.get() {
+                    let _ = tx.send(OutMsg::Message {
+                        msg_type: "5",
+                        fields: vec![],
+                    });
+                }
+                shared.logged_out.set();
+                break;
+            }
+            Inbound::Heartbeat | Inbound::SequenceReset { .. } => {}
+            Inbound::TestRequest { test_req_id } => {
+                let _ = tx.send(OutMsg::Message {
+                    msg_type: "0",
+                    fields: codec::build_heartbeat(Some(&test_req_id)),
+                });
+            }
+            Inbound::ResendRequest => {
+                let (begin_seq, end_seq) = parse_resend_range(&msg).unwrap();
+                let _ = tx.send(OutMsg::GapFill { begin_seq, end_seq });
+            }
+            Inbound::SecurityDefinition {
+                symbol,
+                instrument_id,
+                ..
+            } => {
+                let instrument = Instrument::new(instrument_id, &symbol);
+                shared.instruments.lock().unwrap().put(instrument.clone());
+                shared.callback.lock().unwrap().on_instrument(&instrument);
+            }
+            Inbound::ExecutionReport(data) => handle_execution_report(&shared, data),
+            Inbound::CancelReject {
+                cl_ord_id,
+                orig_cl_ord_id,
+                state,
+                reason,
+            } => {
+                let mut orders = shared.orders.lock().unwrap();
+                if let Ok(id) = cl_ord_id.parse::<i32>() {
+                    orders.remove(&id);
+                }
+                let view = orig_cl_ord_id
+                    .parse::<i32>()
+                    .ok()
+                    .and_then(|id| orders.get_mut(&id))
+                    .map(|o| {
+                        o.state = state;
+                        o.clone()
+                    });
+                drop(orders);
+                shared
+                    .log
+                    .event(&format!("Cancel/replace rejected: {reason}"));
+                if let Some(view) = view {
+                    shared.callback.lock().unwrap().on_order_status(&view);
+                }
+            }
+            Inbound::BusinessReject { reason } | Inbound::SessionReject { reason } => {
+                shared.log.event(&reason)
+            }
+            Inbound::QuoteAcknowledgement { status, reason, .. } => shared
+                .log
+                .event(&format!("quote status {status}: {reason}")),
+            _ => send_business_reject(
+                &tx,
+                msg.seq(),
+                msg.msg_type().unwrap(),
+                3,
+                "unsupported incoming message",
+            ),
+        }
+    }
+    shared.connected.reset();
+    shared.logged_in.reset();
+    shared.logged_out.set();
+    let _ = tx.send(OutMsg::Shutdown);
+}
+
+fn handle_execution_report(shared: &InitiatorShared, data: crate::fix::codec::ExecReportData) {
+    let is_quote = data.cl_ord_id.is_empty() || data.exchange_id.starts_with("quote.");
+    let id = if is_quote {
+        0
+    } else {
+        match data.cl_ord_id.parse::<i32>() {
+            Ok(n) => n,
+            Err(_) => {
+                shared.log.event("unrecognized ClOrdID in execution report");
+                return;
+            }
+        }
+    };
+    let mut view = None;
     if !is_quote {
         let mut orders = shared.orders.lock().unwrap();
+        let original = data
+            .orig_cl_ord_id
+            .as_ref()
+            .and_then(|s| s.parse::<i32>().ok());
+        let template = original.and_then(|n| orders.get(&n).cloned());
+        if !orders.contains_key(&id) {
+            if let Some(mut old) = template {
+                old.id = id;
+                orders.insert(id, old);
+            }
+        }
         if let Some(record) = orders.get_mut(&id) {
             record.exchange_id = data.exchange_id.clone();
             record.remaining = data.remaining;
             record.price = data.price;
             record.quantity = data.quantity;
             record.state = data.state;
-            order_view = Some(record.clone());
-        } else {
-            log::warn!("unknown order clOrdID {}", data.cl_ord_id);
+            view = Some(record.clone());
+        }
+        if let Some(original) = original.filter(|n| *n != id) {
+            orders.remove(&original);
         }
     }
-
     if data.is_fill {
-        let fill = FillView {
+        shared.callback.lock().unwrap().on_fill(&FillView {
             is_quote,
-            order_id: if is_quote { None } else { Some(id) },
-            exchange_id: data.exchange_id.clone(),
-            symbol: data.symbol.clone(),
+            order_id: (!is_quote).then_some(id),
+            exchange_id: data.exchange_id,
+            symbol: data.symbol,
             side: data.side,
             price: data.last_price,
             quantity: data.last_quantity,
-        };
-        shared.callback.lock().unwrap().on_fill(&fill);
+        });
     }
-
-    if let Some(view) = &order_view {
-        shared.callback.lock().unwrap().on_order_status(view);
+    if let Some(view) = view {
+        shared.callback.lock().unwrap().on_order_status(&view);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sequence_message(seq: u64, kind: &str, extra: &[(u32, &str)]) -> frame::FixMessage {
+        let mut fields = vec![(35, kind.into()), (34, seq.to_string())];
+        fields.extend(extra.iter().map(|(tag, value)| (*tag, value.to_string())));
+        frame::FixMessage {
+            begin_string: "FIX.4.2".into(),
+            fields,
+            raw: String::new(),
+        }
+    }
+
+    #[test]
+    fn saturated_outbound_queue_closes_transport() {
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let (tx, rx) =
+            mpsc::channel_with_flag(1, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        tx.send(OutMsg::Message {
+            msg_type: "0",
+            fields: vec![],
+        })
+        .unwrap();
+        assert!(tx
+            .send(OutMsg::Message {
+                msg_type: "0",
+                fields: vec![]
+            })
+            .is_err());
+        let state = WriterState {
+            stream,
+            begin_string: "FIX.4.2".into(),
+            sender_comp_id: "S".into(),
+            target_comp_id: "T".into(),
+            seq: 0,
+            log: SessionLog::disabled(),
+            wire_ids: None,
+        };
+        writer_loop(state, rx, Duration::from_secs(30), tx.failure_flag());
+        assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn gapfill_overlap_and_reset_mode_recover_without_replaying() {
+        let mut state = SequenceState::new(5);
+        assert!(matches!(
+            state.classify(sequence_message(7, "0", &[])).unwrap(),
+            SequenceAction::Gap {
+                request_from: Some(5)
+            }
+        ));
+        let overlap = sequence_message(3, "4", &[(43, "Y"), (123, "Y"), (36, "7")]);
+        assert!(matches!(
+            state.classify(overlap.clone()).unwrap(),
+            SequenceAction::Ready(_)
+        ));
+        state.advance(&overlap).unwrap();
+        assert_eq!(state.take_ready().unwrap().seq(), Some(7));
+        assert!(matches!(
+            state
+                .classify(sequence_message(3, "0", &[(43, "Y")]))
+                .unwrap(),
+            SequenceAction::Duplicate
+        ));
+        assert!(state.classify(sequence_message(3, "0", &[])).is_err());
+        let reset = sequence_message(99, "4", &[(36, "10")]);
+        assert!(matches!(
+            state.classify(reset.clone()).unwrap(),
+            SequenceAction::Ready(_)
+        ));
+        state.advance(&reset).unwrap();
+        assert_eq!(state.expected, 10);
+        assert!(state
+            .advance(&sequence_message(10, "4", &[(36, "9")]))
+            .is_err());
+    }
 
     #[test]
     fn test_client_admitted() {

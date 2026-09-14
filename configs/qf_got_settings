@@ -1,13 +1,25 @@
-# FIX acceptor settings (exchange side)
-BeginString=FIX.4.2
-SenderCompID=GOX
-SocketAcceptPort=5001
+# FIX acceptor settings (exchange side), in QuickFIX's DEFAULT/SESSION form.
+[DEFAULT]
 ConnectionType=acceptor
-UseDataDictionary=false
+BeginString=FIX.4.2
+HeartBtInt=30
 ResetOnLogout=Y
 ResetOnDisconnect=Y
 PersistMessages=N
+UseDataDictionary=Y
 Logging=Y
+FileLogPath=logs/exchange
+# Project extension: Y permits dynamic CompIDs; N uses declared SESSION rows.
 DynamicSessions=N
-# declared client sessions: only these CompIDs may log on (ADR-0006)
-TargetCompIDs=CLIENT,PLAYBACK
+
+# Declared client session 1.
+[SESSION]
+SenderCompID=GOX
+TargetCompID=CLIENT
+SocketAcceptPort=5001
+
+# Declared client session 2.
+[SESSION]
+SenderCompID=GOX
+TargetCompID=PLAYBACK
+SocketAcceptPort=5001

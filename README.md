@@ -10,7 +10,7 @@ go-trader 的 Rust 重写（自研底座）。价格-时间优先撮合引擎、
 
 ```bash
 cargo build --release   # 产物在 target/release/{exchange,client,playback}.exe
-cargo test              # 31 个单元测试（含翻译自 Go 版的撮合核心测试）
+cargo test              # 单元测试（含 FIX 配置、日志和独立的撮合核心测试）
 ```
 
 ## 运行
@@ -19,9 +19,9 @@ cargo test              # 31 个单元测试（含翻译自 Go 版的撮合核�
 # 终端 1：交易所（REST :8080 + FIX acceptor :5001）
 ./target/release/exchange
 # 终端 2：回放模拟市场（复用 go-trader 的 configs/）
-./target/release/playback -file configs/playback.txt
+./target/release/playback -fix configs/qf_connector_settings -id PLAYBACK -file configs/playback.txt
 # 终端 3：下单 REPL
-./target/release/client
+./target/release/client -fix configs/qf_connector_settings -id CLIENT
 buy AAPL 3          # 市价单
 buy AAPL 5 100.5    # 限价单
 quit
@@ -36,9 +36,42 @@ curl http://localhost:8080/api/stats/AAPL
 curl http://localhost:8080/api/sessions
 ```
 
+后台服务使用 `exchange --server`：进程持续监听 FIX/REST，不读取标准输入，由 systemd、容器或调用方管理进程生命周期。默认仍为交互模式，`quit` 或 stdin EOF 退出。
+
 交易所交互控制台：`help` / `sessions` / `book SYMBOL` / `list` / `quit`。
 
-FIX 接入采用预定义会话表：`configs/qf_got_settings` 的 `TargetCompIDs` 声明允许的客户端 CompID（未声明即拒，见 [docs/adr/0006-declared-session-admission.md](docs/adr/0006-declared-session-admission.md)）；`DynamicSessions=Y` 可恢复任意接入。
+FIX 接入采用 QuickFIX 的预定义会话表：`configs/qf_got_settings` 的每个 `[SESSION]` 通过 `TargetCompID` 声明一个允许的客户端 CompID（未声明即拒，见 [docs/adr/0006-declared-session-admission.md](docs/adr/0006-declared-session-admission.md)）；`DynamicSessions=Y` 是本项目扩展，可恢复任意接入。`qf_connector_settings` 同时声明 `CLIENT` 和 `PLAYBACK` 两个 initiator，两个工具用 `-id` 选择对应会话。
+
+## FIX settings
+
+配置文件使用 QuickFIX 的 `[DEFAULT]`/`[SESSION]` 结构。`[DEFAULT]` 中的值由每个 `[SESSION]` 继承，SESSION 中的同名值覆盖默认值；多个 SESSION 按文件顺序保留，不会被压成一个全局 map。相同 BeginString/SenderCompID/TargetCompID 的重复会话会被拒绝。命令行程序会按 `ConnectionType` 和 `-id` 选择会话，缺少必要字段或出现多个匹配会话都会在启动时失败。
+
+当前实现的 FIX 4.2 profile 支持 `ConnectionType`、`BeginString`、`SenderCompID`、`TargetCompID`、`SocketAcceptPort`、`SocketConnectHost`、`SocketConnectPort`、`HeartBtInt`、`ResetOnLogout`、`ResetOnDisconnect`、`PersistMessages`、`UseDataDictionary`、`DataDictionary` 和 `FileLogPath`。布尔值必须是大写 `Y` 或 `N`，端口和心跳必须是有效的正整数；`BeginString` 必须为 `FIX.4.2`。未知键会被拒绝。
+
+省略配置时采用 QuickFIX 默认值（PersistMessages=Y、ResetOnDisconnect=N、ResetOnLogout=N），这些默认值超出当前实现范围，会明确报错。当前会话层是内存态实现，因此必须显式使用 `PersistMessages=N`、`ResetOnDisconnect=Y`、`ResetOnLogout=Y` 和 `UseDataDictionary=Y`；`PersistMessages=Y`、任一非重置设置或 `UseDataDictionary=N` 会明确报错。数据字典使用内置 FIX 4.2 profile；其它路径不会被假装当作已加载的字典。
+
+`Logging`、`DynamicSessions` 和 `TargetCompIDs` 是项目扩展，已经在配置解析器中显式列出。`Logging=Y/N` 控制文件日志；`DynamicSessions=Y` 允许动态客户端；兼容旧配置的 `TargetCompIDs` 只用于准入扩展，QuickFIX 风格配置应优先为每个客户端写独立 `[SESSION]` 的 `TargetCompID`。
+
+最小 acceptor 配置如下（同一监听端口可继续添加 `[SESSION]` 声明其它客户端）：
+
+```ini
+[DEFAULT]
+ConnectionType=acceptor
+BeginString=FIX.4.2
+HeartBtInt=30
+ResetOnLogout=Y
+ResetOnDisconnect=Y
+PersistMessages=N
+UseDataDictionary=Y
+Logging=Y
+
+[SESSION]
+SenderCompID=GOX
+TargetCompID=CLIENT
+SocketAcceptPort=5001
+```
+
+initiator SESSION 还必须提供 `SenderCompID`、`TargetCompID`、`SocketConnectHost` 和 `SocketConnectPort`；`client` 与 `playback` 通过 `-id` 在同一配置文件中选择不同 SESSION。
 
 ## 模块
 
@@ -62,9 +95,9 @@ src/
 
 ## 与 Go 版的契约
 
-FIX 端口/消息流/回报语义、REST 端点与 JSON 字段、撮合规则与订单状态机与 Go 版一致。契约基线自 2026-09-13 起收缩（见 [docs/adr/0003-contract-shrink.md](docs/adr/0003-contract-shrink.md)）：不再支持 SecurityDefinitionRequest(c) 运行期动态建品种（品种仅来自 instruments.txt）、交易所控制台无 watch/unwatch、客户端不再读取 got_settings。已实现交换流程（playback 行情、client 下单/回报、REST 查询）两版二进制仍可互换；双向交叉验证（Go playback 驱动 Rust exchange；Rust playback 驱动 Go exchange）已通过。
+撮合与 REST 保留原有设计。FIX 线协议已经按 4.2 修正，旧 Go 版的 4.4 回报不再作为兼容性依据。当前协议范围、扩展与审计结果见 [FIX 4.2 审计与实现范围](docs/fix42-audit.md)。独立线协议验证：先 `cargo build --bins`，再 `python tests/fix42_wire.py`；字典来源和测试边界见 [tests/README.md](tests/README.md)。
 
 ## 排错
 
-- **FIX 会话日志**：每个会话两个文件（quickfixgo 风格）。acceptor 写 `logs/exchange/{BeginString-Sender-Target}.messages|event.current.log`；client 写 `logs/client/`、playback 写 `logs/playback/`。messages 记每条收发报文原文（`in`/`out` 方向前缀，含心跳）；event 记会话事件（登录/注销/序列号/超时，措辞对齐 quickfixgo）。settings 键 `Logging=Y/N`（默认 Y）与 `FileLogPath`（默认见上）可覆盖，见 ADR-0005。
+- **FIX 会话日志**：每个会话两个文件（QuickFIX/Go 风格）。acceptor 写 `logs/exchange/{BeginString-Sender-Target}.messages|event.current.log`；client 写 `logs/client/`、playback 写 `logs/playback/`。messages 记每条收发报文原文（`in`/`out` 方向前缀，含心跳）；帧损坏时保留 `in-hex` 的无损十六进制；event 记会话事件（登录/注销/序列号/超时，措辞对齐 QuickFIX/Go）。`Logging=Y/N`（默认 Y）与 `FileLogPath` 可覆盖，见 ADR-0005。日志行时间使用 UTC+8、方向标记和损坏帧 hex 是本项目扩展，FIX 报文字段时间仍按 UTC。
 - Windows 下构建前确保没有残留的 exchange/client/playback 进程锁住 target 下的 exe；运行前确认 8080/5001 端口未被占用（报 os error 10048 即端口冲突）。

@@ -2,7 +2,7 @@ use std::io::BufRead;
 
 use gotrader::core::instrument::Instrument;
 use gotrader::core::order::Side;
-use gotrader::fix::config::FixConfig;
+use gotrader::fix::config::{ConfigError, FixConfig, SessionSettings};
 use gotrader::fix::log::LogConfig;
 use gotrader::fix::session::{Callback, FillView, Initiator, InitiatorConfig, OrderView};
 
@@ -14,18 +14,31 @@ impl Callback for PrintCallback {
     }
 
     fn on_order_status(&mut self, order: &OrderView) {
-        let state = if order.state.is_active() { "active" } else { "inactive" };
+        let state = if order.state.is_active() {
+            "active"
+        } else {
+            "inactive"
+        };
         println!(
             "order {} {} {} {:?} qty {} @ {} remaining {} ({})",
-            order.id, order.symbol, order.side.as_str(), order.state,
-            d(order.quantity), d(order.price), d(order.remaining), state
+            order.id,
+            order.symbol,
+            order.side.as_str(),
+            order.state,
+            d(order.quantity),
+            d(order.price),
+            d(order.remaining),
+            state
         );
     }
 
     fn on_fill(&mut self, fill: &FillView) {
         println!(
             "fill {} {} {} @ {}",
-            fill.symbol, fill.side.as_str(), d(fill.quantity), d(fill.price)
+            fill.symbol,
+            fill.side.as_str(),
+            d(fill.quantity),
+            d(fill.price)
         );
     }
 }
@@ -36,35 +49,67 @@ fn d(v: rust_decimal::Decimal) -> String {
 }
 
 fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let mut fix_path = "configs/qf_connector_settings".to_string();
     let mut sender_comp_id = "CLIENT".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "-fix" => fix_path = args.next().unwrap_or_else(|| fix_path.clone()),
-            "-id" => sender_comp_id = args.next().unwrap_or_else(|| sender_comp_id.clone()),
-            other => println!("unknown argument {}", other),
+            "-fix" => match args.next() {
+                Some(value) if !value.is_empty() => fix_path = value,
+                _ => die("-fix requires a settings file path"),
+            },
+            "-id" => match args.next() {
+                Some(value) if !value.is_empty() => sender_comp_id = value,
+                _ => die("-id requires a SenderCompID"),
+            },
+            "-h" | "--help" => {
+                println!("usage: client [-fix SETTINGS] [-id SENDER_COMP_ID]");
+                return;
+            }
+            other => die(&format!("unknown argument {other:?}")),
         }
     }
 
     let config = match FixConfig::load_file(&fix_path) {
         Ok(config) => config,
-        Err(e) => {
-            eprintln!("unable to load fix settings {}: {}", fix_path, e);
-            std::process::exit(1);
-        }
+        Err(e) => die(&format!("unable to load fix settings {fix_path}: {e}")),
+    };
+    let settings = match config.initiator(Some(&sender_comp_id)) {
+        Ok(settings) => settings,
+        Err(e) => die_config(e),
+    };
+    if let Err(e) = FixConfig::validate_supported_runtime(&settings) {
+        die_config(e);
+    }
+    let sender_comp_id = required(&settings, "SenderCompID");
+    let target_comp_id = required(&settings, "TargetCompID");
+    let host = required(&settings, "SocketConnectHost");
+    let port = match settings.required_u16("initiator [SESSION]", "SocketConnectPort") {
+        Ok(port) => port,
+        Err(e) => die_config(e),
+    };
+    let heart_bt_int = match settings.required_u32("initiator [SESSION]", "HeartBtInt") {
+        Ok(value) => value,
+        Err(e) => die_config(e),
+    };
+    let log = match LogConfig::from_settings(&settings, "logs/client") {
+        Ok(log) => log,
+        Err(e) => die_config(e),
     };
     let initiator_cfg = InitiatorConfig {
         sender_comp_id,
-        target_comp_id: config.get_or("TargetCompID", "GOX"),
-        host: config.get_or("SocketConnectHost", "localhost"),
-        port: config.get_or("SocketConnectPort", "5001").parse().unwrap_or(5001),
-        heart_bt_int: config.get_or("HeartBtInt", "30").parse().unwrap_or(30),
-        log: LogConfig::from_config(&config, "logs/client"),
+        target_comp_id,
+        host,
+        port,
+        heart_bt_int,
+        log,
     };
 
-    let mut initiator =
-        Initiator::connect(initiator_cfg, Box::new(PrintCallback)).expect("exchange is not connected");
+    let mut initiator = match Initiator::connect(initiator_cfg, Box::new(PrintCallback)) {
+        Ok(initiator) => initiator,
+        Err(error) => die(&format!("unable to connect to exchange: {error}")),
+    };
     println!("commands: buy|sell SYMBOL QTY [PRICE] | modify ID PRICE QTY | cancel ID | quit");
     let stdin = std::io::stdin();
     loop {
@@ -119,14 +164,17 @@ fn main() {
                 },
                 _ => println!("usage: cancel ID"),
             },
-            Some("modify") => match (parts.len(), parts[1].parse::<i32>()) {
-                (4, Ok(id)) => match (parts[2].parse::<rust_decimal::Decimal>(), parts[3].parse::<rust_decimal::Decimal>()) {
+            Some("modify") => match parts.as_slice() {
+                [_, id_text, price_text, quantity_text] => match id_text.parse::<i32>() {
+                    Ok(id) => match (price_text.parse::<rust_decimal::Decimal>(), quantity_text.parse::<rust_decimal::Decimal>()) {
                     (Ok(price), Ok(quantity)) => {
                         if initiator.modify_order(id, price, quantity).is_err() {
                             println!("unable to modify order {} (unknown id or not connected)", id);
                         }
                     }
                     _ => println!("invalid price or quantity"),
+                },
+                    Err(_) => println!("invalid order id {}", id_text),
                 },
                 _ => println!("usage: modify ID PRICE QTY"),
             },
@@ -137,4 +185,26 @@ fn main() {
     // give the reader thread a moment to deliver reports already in flight
     std::thread::sleep(std::time::Duration::from_millis(300));
     println!("we are logged out!");
+}
+
+fn required(settings: &SessionSettings, key: &str) -> String {
+    settings
+        .get(key)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            die_config(ConfigError::Missing {
+                section: "initiator [SESSION]".to_string(),
+                key: key.to_string(),
+            })
+        })
+}
+
+fn die_config(error: ConfigError) -> ! {
+    die(&error.to_string())
+}
+
+fn die(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(1);
 }

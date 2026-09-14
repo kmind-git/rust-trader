@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use rust_decimal::Decimal;
@@ -45,28 +45,68 @@ pub struct RawTrade {
 #[derive(Debug)]
 struct PriceLevel {
     price: Decimal,
-    orders: VecDeque<Order>,
+    orders: BTreeMap<i64, Order>,
+    index: HashMap<(String, OrderId), i64>,
+    total: Decimal,
+    next: i64,
 }
 
 impl PriceLevel {
+    fn new(price: Decimal) -> Self {
+        Self {
+            price,
+            orders: BTreeMap::new(),
+            index: HashMap::new(),
+            total: Decimal::ZERO,
+            next: 0,
+        }
+    }
     fn top(&self) -> &Order {
-        self.orders.front().expect("level is never empty")
+        self.orders.first_key_value().unwrap().1
     }
-
     fn push_back(&mut self, order: Order) {
-        self.orders.push_back(order);
+        let key = self.next;
+        self.next = self
+            .next
+            .checked_add(1)
+            .expect("price level priority exhausted");
+        self.insert_at(key, order);
     }
-
+    fn insert_at(&mut self, key: i64, order: Order) {
+        let identity = (order.session_id.clone(), order.id);
+        assert!(
+            !self.index.contains_key(&identity),
+            "duplicate order in price level"
+        );
+        self.total += order.remaining;
+        self.index.insert(identity, key);
+        self.orders.insert(key, order);
+    }
     #[cfg(test)]
     fn push_front(&mut self, order: Order) {
-        self.orders.push_front(order);
+        let key = self
+            .orders
+            .first_key_value()
+            .map(|(k, _)| *k - 1)
+            .unwrap_or(-1);
+        self.insert_at(key, order);
     }
-
-    fn remove(&mut self, session_id: &str, id: OrderId) -> Result<Order, ()> {
-        let pos = self.orders.iter().position(|o| o.session_id == session_id && o.id == id);
-        match pos {
-            Some(pos) => Ok(self.orders.remove(pos).unwrap()),
-            None => Err(()),
+    fn locate_mut(&mut self, session: &str, id: OrderId) -> Option<&mut Order> {
+        let key = self.index.get(&(session.to_string(), id))?;
+        self.orders.get_mut(key)
+    }
+    fn remove(&mut self, session: &str, id: OrderId) -> Result<Order, ()> {
+        let key = self.index.remove(&(session.to_string(), id)).ok_or(())?;
+        let order = self.orders.remove(&key).unwrap();
+        self.total -= order.remaining;
+        Ok(order)
+    }
+    fn update_fill(&mut self, order: &Order, quantity: Decimal) {
+        if order.remaining.is_zero() {
+            self.remove(&order.session_id, order.id).unwrap();
+        } else {
+            self.total -= quantity;
+            *self.locate_mut(&order.session_id, order.id).unwrap() = order.clone();
         }
     }
 }
@@ -77,13 +117,17 @@ impl PriceLevel {
 #[derive(Debug)]
 pub struct OrderBook {
     pub instrument_id: i64,
-    bids: Vec<PriceLevel>,
-    asks: Vec<PriceLevel>,
+    bids: BTreeMap<Decimal, PriceLevel>,
+    asks: BTreeMap<Decimal, PriceLevel>,
 }
 
 impl OrderBook {
     pub fn new(instrument_id: i64) -> OrderBook {
-        OrderBook { instrument_id, bids: Vec::new(), asks: Vec::new() }
+        OrderBook {
+            instrument_id,
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+        }
     }
 
     /// insert an order (state set to Booked), run matching, and cancel any
@@ -96,7 +140,12 @@ impl OrderBook {
         let trades = self.match_trades();
 
         let mut final_state = None;
-        match self.locate_mut(&order.session_id, order.id) {
+        match self.locate_mut(
+            &order.session_id,
+            order.id,
+            order.side,
+            order.effective_price(),
+        ) {
             Some(resting) => {
                 // a market order never rests: cancel any unfilled remainder
                 if order.order_type == OrderType::Market && resting.remaining > Decimal::ZERO {
@@ -104,7 +153,12 @@ impl OrderBook {
                 }
                 if resting.state == OrderState::Cancelled {
                     let removed = self
-                        .remove(&order.session_id, order.id, order.side, order.effective_price())
+                        .remove(
+                            &order.session_id,
+                            order.id,
+                            order.side,
+                            order.effective_price(),
+                        )
                         .expect("order was just located in the book");
                     final_state = Some(removed);
                 } else {
@@ -132,18 +186,10 @@ impl OrderBook {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
         };
-        // bids descending, asks ascending; an exact price match joins the level
-        let idx = match order.side {
-            Side::Buy => levels.partition_point(|l| l.price > price),
-            Side::Sell => levels.partition_point(|l| l.price < price),
-        };
-        if idx < levels.len() && levels[idx].price == price {
-            levels[idx].push_back(order.clone());
-        } else {
-            let mut level = PriceLevel { price, orders: VecDeque::new() };
-            level.push_back(order.clone());
-            levels.insert(idx, level);
-        }
+        levels
+            .entry(price)
+            .or_insert_with(|| PriceLevel::new(price))
+            .push_back(order.clone());
     }
 
     /// continuous matching: while best bid crosses best ask, trade at the
@@ -155,8 +201,11 @@ impl OrderBook {
         loop {
             // snapshot the two tops
             let (bid, ask) = {
-                let (Some(b), Some(a)) = (self.bids.first(), self.asks.first()) else { break };
-                (b.top().clone(), a.top().clone())
+                let (Some(b), Some(a)) = (self.bids.last_key_value(), self.asks.first_key_value())
+                else {
+                    break;
+                };
+                (b.1.top().clone(), a.1.top().clone())
             };
 
             if bid.effective_price() < ask.effective_price() {
@@ -164,52 +213,51 @@ impl OrderBook {
             }
 
             // trade at the resting (earlier arrival) order's price
-            let price = if bid.arrival < ask.arrival { bid.price } else { ask.price };
+            let price = if bid.arrival < ask.arrival {
+                bid.price
+            } else {
+                ask.price
+            };
             let quantity = min_decimal(bid.remaining, ask.remaining);
 
             let mut buyer = bid.clone();
             let mut seller = ask.clone();
-            buyer.remaining -= quantity;
-            buyer.state = if buyer.remaining.is_zero() { OrderState::Filled } else { OrderState::PartialFill };
-            seller.remaining -= quantity;
-            seller.state = if seller.remaining.is_zero() { OrderState::Filled } else { OrderState::PartialFill };
+            apply_fill(&mut buyer, quantity, price);
+            apply_fill(&mut seller, quantity, price);
 
-            // write the post-fill state back and pop fully filled orders
-            if buyer.remaining.is_zero() {
-                self.bids[0].orders.pop_front();
-                if self.bids[0].orders.is_empty() {
-                    self.bids.remove(0);
+            for (levels, order) in [(&mut self.bids, &buyer), (&mut self.asks, &seller)] {
+                let key = order.effective_price();
+                let level = levels.get_mut(&key).unwrap();
+                level.update_fill(order, quantity);
+                if level.orders.is_empty() {
+                    levels.remove(&key);
                 }
-            } else {
-                let front = self.bids[0].orders.front_mut().unwrap();
-                front.remaining = buyer.remaining;
-                front.state = buyer.state;
-            }
-            if seller.remaining.is_zero() {
-                self.asks[0].orders.pop_front();
-                if self.asks[0].orders.is_empty() {
-                    self.asks.remove(0);
-                }
-            } else {
-                let front = self.asks[0].orders.front_mut().unwrap();
-                front.remaining = seller.remaining;
-                front.state = seller.state;
             }
 
-            trades.push(RawTrade { buyer, seller, price, quantity, trade_id: 0, when });
+            trades.push(RawTrade {
+                buyer,
+                seller,
+                price,
+                quantity,
+                trade_id: 0,
+                when,
+            });
         }
         trades
     }
 
-    fn locate_mut(&mut self, session_id: &str, id: OrderId) -> Option<&mut Order> {
-        for level in self.bids.iter_mut().chain(self.asks.iter_mut()) {
-            for order in level.orders.iter_mut() {
-                if order.session_id == session_id && order.id == id {
-                    return Some(order);
-                }
-            }
-        }
-        None
+    fn locate_mut(
+        &mut self,
+        session: &str,
+        id: OrderId,
+        side: Side,
+        price: Decimal,
+    ) -> Option<&mut Order> {
+        let levels = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        levels.get_mut(&price)?.locate_mut(session, id)
     }
 
     /// remove an order from the book; an active order becomes Cancelled.
@@ -225,16 +273,10 @@ impl OrderBook {
             Side::Buy => &mut self.bids,
             Side::Sell => &mut self.asks,
         };
-        let idx = match side {
-            Side::Buy => levels.partition_point(|l| l.price > price),
-            Side::Sell => levels.partition_point(|l| l.price < price),
-        };
-        if idx >= levels.len() || levels[idx].price != price {
-            return Err(());
-        }
-        let removed = levels[idx].remove(session_id, id).map_err(|_| ())?;
-        if levels[idx].orders.is_empty() {
-            levels.remove(idx);
+        let level = levels.get_mut(&price).ok_or(())?;
+        let removed = level.remove(session_id, id)?;
+        if level.orders.is_empty() {
+            levels.remove(&price);
         }
         let mut removed = removed;
         if removed.state.is_active() {
@@ -248,23 +290,41 @@ impl OrderBook {
         Book {
             instrument_id: self.instrument_id,
             sequence: 0,
-            bids: build_levels(&self.bids),
-            asks: build_levels(&self.asks),
+            bids: build_levels(self.bids.values().rev()),
+            asks: build_levels(self.asks.values()),
         }
     }
 }
 
-fn build_levels(levels: &[PriceLevel]) -> Vec<BookLevel> {
+fn build_levels<'a>(levels: impl Iterator<Item = &'a PriceLevel>) -> Vec<BookLevel> {
     levels
-        .iter()
-        .map(|level| {
-            let mut quantity = Decimal::ZERO;
-            for order in &level.orders {
-                quantity += order.remaining;
-            }
-            BookLevel { price: level.price, quantity }
+        .map(|level| BookLevel {
+            price: level.price,
+            quantity: level.total,
         })
         .collect()
+}
+
+/// Update the execution accounting carried by an order snapshot.  The engine
+/// rejects non-positive order quantities at its public boundary, so a normal
+/// match always has a strictly positive quantity here.  Keeping the weighted
+/// average in the order itself avoids losing the history when a partially
+/// filled order is cancel/replaced.
+fn apply_fill(order: &mut Order, quantity: Decimal, price: Decimal) {
+    let previous_cum = order.cum_quantity;
+    let new_cum = previous_cum + quantity;
+    if new_cum.is_zero() {
+        order.avg_price = Decimal::ZERO;
+    } else {
+        order.avg_price = (order.avg_price * previous_cum + price * quantity) / new_cum;
+    }
+    order.cum_quantity = new_cum;
+    order.remaining -= quantity;
+    order.state = if order.remaining.is_zero() {
+        OrderState::Filled
+    } else {
+        OrderState::PartialFill
+    };
 }
 
 #[cfg(test)]
@@ -272,8 +332,69 @@ mod tests {
     use super::super::instrument::Instrument;
     use super::*;
 
-    fn limit(session: &str, id: OrderId, inst: &Instrument, side: Side, price: &str, qty: &str, arrival: u64) -> Order {
-        Order::limit(session, id, inst.id, side, price.parse().unwrap(), qty.parse().unwrap(), arrival)
+    fn limit(
+        session: &str,
+        id: OrderId,
+        inst: &Instrument,
+        side: Side,
+        price: &str,
+        qty: &str,
+        arrival: u64,
+    ) -> Order {
+        Order::limit(
+            session,
+            id,
+            inst.id,
+            side,
+            price.parse().unwrap(),
+            qty.parse().unwrap(),
+            arrival,
+        )
+    }
+
+    #[test]
+    fn aggregate_and_index_stay_consistent_through_mixed_operations() {
+        let mut book = OrderBook::new(1);
+        for id in 1..=1000 {
+            let side = if id % 3 == 0 { Side::Sell } else { Side::Buy };
+            book.add(Order::limit(
+                "mixed",
+                id,
+                1,
+                side,
+                Decimal::from(95 + id % 11),
+                Decimal::from(1 + id % 5),
+                id as u64,
+            ));
+            if id % 4 == 0 {
+                let previous = id - 2;
+                let previous_side = if previous % 3 == 0 {
+                    Side::Sell
+                } else {
+                    Side::Buy
+                };
+                let _ = book.remove(
+                    "mixed",
+                    previous,
+                    previous_side,
+                    Decimal::from(95 + previous % 11),
+                );
+            }
+            for level in book.bids.values().chain(book.asks.values()) {
+                assert_eq!(
+                    level.total,
+                    level.orders.values().map(|o| o.remaining).sum::<Decimal>()
+                );
+                assert_eq!(level.index.len(), level.orders.len());
+                assert!(!level.orders.is_empty());
+                for (key, order) in &level.orders {
+                    assert_eq!(
+                        level.index.get(&(order.session_id.clone(), order.id)),
+                        Some(key)
+                    );
+                }
+            }
+        }
     }
 
     // --- translated from orderlist_test.go ---
@@ -281,7 +402,7 @@ mod tests {
     #[test]
     fn test_order_list_push_back() {
         let inst = Instrument::new(1, "AAPL");
-        let mut level = PriceLevel { price: "100".parse().unwrap(), orders: VecDeque::new() };
+        let mut level = PriceLevel::new("100".parse().unwrap());
         let o1 = limit("c1", 1, &inst, Side::Buy, "100", "10", 1);
         let o2 = limit("c1", 2, &inst, Side::Buy, "100", "20", 2);
 
@@ -297,7 +418,7 @@ mod tests {
     #[test]
     fn test_order_list_push_front() {
         let inst = Instrument::new(1, "AAPL");
-        let mut level = PriceLevel { price: "100".parse().unwrap(), orders: VecDeque::new() };
+        let mut level = PriceLevel::new("100".parse().unwrap());
         let o1 = limit("c1", 1, &inst, Side::Buy, "100", "10", 1);
         let o2 = limit("c1", 2, &inst, Side::Buy, "100", "20", 2);
 
@@ -311,7 +432,7 @@ mod tests {
     #[test]
     fn test_order_list_remove() {
         let inst = Instrument::new(1, "AAPL");
-        let mut level = PriceLevel { price: "100".parse().unwrap(), orders: VecDeque::new() };
+        let mut level = PriceLevel::new("100".parse().unwrap());
         let o1 = limit("c1", 1, &inst, Side::Buy, "100", "10", 1);
         let o2 = limit("c1", 2, &inst, Side::Buy, "100", "20", 2);
         let o3 = limit("c1", 3, &inst, Side::Buy, "100", "30", 3);
@@ -424,7 +545,14 @@ mod tests {
         let inst = Instrument::new(0, "TEST");
         let mut ob = OrderBook::new(inst.id);
         let _ = ob.add(limit("X", 1, &inst, Side::Buy, "100", "10", 1));
-        let (trades, final_state) = ob.add(Order::market("X", 2, inst.id, Side::Sell, "25".parse().unwrap(), 2));
+        let (trades, final_state) = ob.add(Order::market(
+            "X",
+            2,
+            inst.id,
+            Side::Sell,
+            "25".parse().unwrap(),
+            2,
+        ));
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].quantity, "10".parse().unwrap());
         // nothing rests: the 15 share remainder is cancelled
@@ -435,7 +563,10 @@ mod tests {
         // shows up in the final state of the order (matches Go report semantics)
         assert_eq!(trades[0].seller.state, OrderState::PartialFill);
         assert_eq!(final_state.as_ref().unwrap().state, OrderState::Cancelled);
-        assert_eq!(final_state.as_ref().unwrap().remaining, "15".parse().unwrap());
+        assert_eq!(
+            final_state.as_ref().unwrap().remaining,
+            "15".parse().unwrap()
+        );
     }
 
     #[test]

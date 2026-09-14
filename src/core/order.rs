@@ -32,13 +32,17 @@ pub enum OrderState {
     PartialFill,
     Filled,
     Cancelled,
+    Expired,
     Rejected,
 }
 
 impl OrderState {
     /// mirrors common.Order.IsActive in the Go implementation
     pub fn is_active(&self) -> bool {
-        !matches!(self, OrderState::Filled | OrderState::Cancelled | OrderState::Rejected)
+        !matches!(
+            self,
+            OrderState::Filled | OrderState::Cancelled | OrderState::Expired | OrderState::Rejected
+        )
     }
 }
 
@@ -55,6 +59,13 @@ pub struct Order {
     pub price: Decimal,
     pub quantity: Decimal,
     pub remaining: Decimal,
+    /// Quantity already executed for this order.  Keeping this on the order
+    /// snapshot lets both the matching engine and FIX reports survive a
+    /// cancel/replace without recomputing from the new order quantity.
+    pub cum_quantity: Decimal,
+    /// Quantity weighted average execution price.  It is zero until the first
+    /// fill and is carried through cancel/replace operations.
+    pub avg_price: Decimal,
     pub state: OrderState,
     /// global monotonic arrival counter; replaces Go's time.Now() ordering and
     /// gives deterministic FIFO priority within a price level
@@ -81,6 +92,8 @@ impl Order {
             price,
             quantity,
             remaining: quantity,
+            cum_quantity: Decimal::ZERO,
+            avg_price: Decimal::ZERO,
             state: OrderState::New,
             arrival,
         }
@@ -97,7 +110,15 @@ impl Order {
         Order {
             price: Decimal::ZERO,
             order_type: OrderType::Market,
-            ..Order::limit(session_id, id, instrument_id, side, Decimal::ZERO, quantity, arrival)
+            ..Order::limit(
+                session_id,
+                id,
+                instrument_id,
+                side,
+                Decimal::ZERO,
+                quantity,
+                arrival,
+            )
         }
     }
 

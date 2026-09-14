@@ -1,8 +1,21 @@
-# FIX initiator settings (client side)
+[DEFAULT]
+# QuickFIX standard settings shared by every initiator session.
+ConnectionType=initiator
 BeginString=FIX.4.2
-TargetCompID=GOX
 SocketConnectHost=localhost
 SocketConnectPort=5001
 HeartBtInt=30
+ResetOnLogout=Y
 ResetOnDisconnect=Y
+PersistMessages=N
+UseDataDictionary=Y
 Logging=Y
+FileLogPath=logs/client
+
+[SESSION]
+SenderCompID=CLIENT
+TargetCompID=GOX
+
+[SESSION]
+SenderCompID=PLAYBACK
+TargetCompID=GOX

@@ -1,8 +1,17 @@
-# client settings with quickfixgo logging enabled (diagnostics)
+# client settings with project file logging enabled (diagnostics)
+[DEFAULT]
+ConnectionType=initiator
 BeginString=FIX.4.2
-TargetCompID=GOX
 SocketConnectHost=localhost
 SocketConnectPort=5001
 HeartBtInt=30
+ResetOnLogout=Y
 ResetOnDisconnect=Y
+PersistMessages=N
+UseDataDictionary=Y
 Logging=Y
+FileLogPath=logs/debug
+
+[SESSION]
+SenderCompID=CLIENT
+TargetCompID=GOX

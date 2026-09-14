@@ -3,7 +3,7 @@
 
 use rust_decimal::Decimal;
 
-use crate::core::exchange::Report;
+use crate::core::exchange::{ExecType, Report};
 use crate::core::order::{OrderState, OrderType, Side};
 
 pub mod msg_type {
@@ -12,6 +12,8 @@ pub mod msg_type {
     pub const RESEND_REQUEST: &str = "2";
     pub const SEQUENCE_RESET: &str = "4";
     pub const LOGOUT: &str = "5";
+    pub const REJECT: &str = "3";
+    pub const ORDER_CANCEL_REJECT: &str = "9";
     pub const EXECUTION_REPORT: &str = "8";
     pub const LOGON: &str = "A";
     pub const NEW_ORDER_SINGLE: &str = "D";
@@ -24,7 +26,7 @@ pub mod msg_type {
     pub const SECURITY_DEFINITION_REQUEST: &str = "c";
     /// FIX 4.2: SecurityDefinition is "d" ("y" is SecurityList)
     pub const SECURITY_DEFINITION: &str = "d";
-    /// FIX 4.2 has no SessionReject; business-level problems use this
+    /// BusinessMessageReject supplements session Reject (3) and order-specific rejects.
     pub const BUSINESS_MESSAGE_REJECT: &str = "j";
     // NOTE: SecurityListRequest ("x") does not exist in FIX 4.2 - instruments
 }
@@ -76,16 +78,22 @@ pub mod tags {
     pub const SECURITY_RESPONSE_TYPE: u32 = 323;
 }
 
-/// FIX numeric fields carry 4 decimal places, matching quickfixgo's
-/// `ToDecimal(x, 4)` output (e.g. "100.0000")
+/// Preserve supported Decimal precision; never round orders on the wire.
 pub fn fix_decimal(d: Decimal) -> String {
-    let mut d = d.round_dp(4);
-    d.rescale(4);
-    d.to_string()
+    d.normalize().to_string()
 }
 
 pub fn parse_decimal(s: &str) -> Result<Decimal, String> {
-    s.parse::<Decimal>().map_err(|e| format!("bad decimal {:?}: {}", s, e))
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    if digits.is_empty()
+        || !digits.bytes().any(|c| c.is_ascii_digit())
+        || digits.bytes().filter(|c| *c == b'.').count() > 1
+        || !digits.bytes().all(|c| c.is_ascii_digit() || c == b'.')
+    {
+        return Err(format!("invalid FIX decimal {s:?}"));
+    }
+    s.parse::<Decimal>()
+        .map_err(|e| format!("bad decimal {s:?}: {e}"))
 }
 
 pub fn side_to_fix(side: Side) -> &'static str {
@@ -110,16 +118,18 @@ pub fn ord_status_to_fix(state: OrderState) -> &'static str {
         OrderState::Filled => "2",
         OrderState::Cancelled => "4",
         OrderState::Rejected => "8",
+        OrderState::Expired => "C",
     }
 }
 
 pub fn ord_status_from_fix(s: &str) -> Result<OrderState, String> {
     match s {
-        "0" => Ok(OrderState::Booked),
+        "0" | "5" => Ok(OrderState::Booked),
         "1" => Ok(OrderState::PartialFill),
         "2" => Ok(OrderState::Filled),
         "4" => Ok(OrderState::Cancelled),
         "8" => Ok(OrderState::Rejected),
+        "C" => Ok(OrderState::Expired),
         _ => Err(format!("unsupported order status {}", s)),
     }
 }
@@ -128,10 +138,22 @@ fn transact_time() -> String {
     chrono::Utc::now().format("%Y%m%d-%H:%M:%S%.3f").to_string()
 }
 
+fn message_identifier(prefix: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!(
+        "{prefix}-{}-{}",
+        chrono::Utc::now().timestamp_micros(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 // ---- initiator -> exchange ----
 
 pub fn build_logon(heart_bt_int: u32) -> Vec<(u32, String)> {
-    vec![(tags::ENCRYPT_METHOD, "0".to_string()), (tags::HEART_BT_INT, heart_bt_int.to_string())]
+    vec![
+        (tags::ENCRYPT_METHOD, "0".to_string()),
+        (tags::HEART_BT_INT, heart_bt_int.to_string()),
+    ]
 }
 
 pub fn build_logout() -> Vec<(u32, String)> {
@@ -166,14 +188,15 @@ pub fn build_new_order_single(
         (
             tags::ORD_TYPE,
             match order_type {
-                OrderType::Limit => "1".to_string(),
-                OrderType::Market => "2".to_string(),
+                OrderType::Limit => "2".to_string(),
+                OrderType::Market => "1".to_string(),
             },
         ),
         (tags::ORDER_QTY, fix_decimal(quantity)),
     ];
-    // Go always sends Price (0 for market orders)
-    fields.push((tags::PRICE, fix_decimal(price)));
+    if order_type == OrderType::Limit {
+        fields.push((tags::PRICE, fix_decimal(price)));
+    }
     fields
 }
 
@@ -181,7 +204,12 @@ pub struct OrderIdForWire(pub String);
 
 /// OrderCancelRequest: ClOrdID is the request's own fresh id; OrigClOrdID
 /// identifies the order being cancelled
-pub fn build_cancel_request(orig_cl_ord_id: &str, cl_ord_id: &str, symbol: &str, side: Side) -> Vec<(u32, String)> {
+pub fn build_cancel_request(
+    orig_cl_ord_id: &str,
+    cl_ord_id: &str,
+    symbol: &str,
+    side: Side,
+) -> Vec<(u32, String)> {
     vec![
         (tags::ORIG_CL_ORD_ID, orig_cl_ord_id.to_string()),
         (tags::CL_ORD_ID, cl_ord_id.to_string()),
@@ -208,7 +236,7 @@ pub fn build_cancel_replace(
         (tags::SYMBOL, symbol.to_string()),
         (tags::SIDE, side_to_fix(side).to_string()),
         (tags::TRANSACT_TIME, transact_time()),
-        (tags::ORD_TYPE, "1".to_string()),
+        (tags::ORD_TYPE, "2".to_string()),
         (tags::ORDER_QTY, fix_decimal(quantity)),
         (tags::PRICE, fix_decimal(price)),
     ]
@@ -222,7 +250,7 @@ pub fn build_mass_quote(
     ask_quantity: Decimal,
 ) -> Vec<(u32, String)> {
     vec![
-        (tags::QUOTE_ID, "1".to_string()),
+        (tags::QUOTE_ID, message_identifier("q")),
         (tags::NO_QUOTE_SETS, "1".to_string()),
         (tags::QUOTE_SET_ID, "1".to_string()),
         (tags::UNDERLYING_SYMBOL, symbol.to_string()), // required in FIX 4.2
@@ -230,96 +258,208 @@ pub fn build_mass_quote(
         (tags::NO_QUOTE_ENTRIES, "1".to_string()),
         (tags::QUOTE_ENTRY_ID, symbol.to_string()),
         (tags::SYMBOL, symbol.to_string()),
-        (tags::BID_SIZE, fix_decimal(bid_quantity)),
         (tags::BID_PX, fix_decimal(bid_price)),
-        (tags::OFFER_SIZE, fix_decimal(ask_quantity)),
         (tags::OFFER_PX, fix_decimal(ask_price)),
+        (tags::BID_SIZE, fix_decimal(bid_quantity)),
+        (tags::OFFER_SIZE, fix_decimal(ask_quantity)),
     ]
 }
 
 // ---- exchange -> initiator ----
 
-/// mirrors sendExecutionReport / sendTradeExecutionReport in Go
-/// FIX 4.2 semantics: ExecType carries the event kind - fills are 1 (Partial
-/// fill) / 2 (Fill), non-fill status reports mirror the order state (0 New /
-/// 4 Canceled / 8 Rejected). "F=Trade" and "I=Order Status" do not exist in 4.2.
+/// Encode the execution event separately from the current order state.
 pub fn build_execution_report(report: &Report) -> Vec<(u32, String)> {
-    let (order, symbol, last_price, last_quantity) = match report {
-        Report::Status { order, symbol } => (order, symbol, None, None),
-        Report::Fill { order, symbol, last_price, last_quantity } => {
-            (order, symbol, Some(*last_price), Some(*last_quantity))
-        }
+    let (order, symbol, cl_ord_id, exec_id, event, original, fill) = match report {
+        Report::Status {
+            order,
+            symbol,
+            cl_ord_id,
+            exec_id,
+            exec_type,
+            orig_cl_ord_id,
+        } => (
+            order,
+            symbol,
+            *cl_ord_id,
+            exec_id,
+            *exec_type,
+            *orig_cl_ord_id,
+            None,
+        ),
+        Report::Fill {
+            order,
+            symbol,
+            last_price,
+            last_quantity,
+            exec_id,
+            orig_cl_ord_id,
+        } => (
+            order,
+            symbol,
+            order.id,
+            exec_id,
+            if order.remaining.is_zero() {
+                ExecType::Fill
+            } else {
+                ExecType::PartialFill
+            },
+            *orig_cl_ord_id,
+            Some((*last_price, *last_quantity)),
+        ),
     };
-    let leaves = order.remaining;
-    let cum = order.quantity - order.remaining;
-    let is_fill = matches!(report, Report::Fill { .. });
-    let exec_type = if is_fill {
-        // 4.2: 1 = Partial fill, 2 = Fill
-        if leaves.is_zero() { "2" } else { "1" }
-    } else {
-        match order.state {
-            OrderState::Cancelled => "4",
-            OrderState::Rejected => "8",
-            _ => "0", // New
-        }
+    let event = match event {
+        ExecType::New => "0",
+        ExecType::PartialFill => "1",
+        ExecType::Fill => "2",
+        ExecType::Cancelled => "4",
+        ExecType::Replaced => "5",
+        ExecType::Rejected => "8",
+        ExecType::Expired => "C",
     };
-    // fill reports show Partial while quantity remains, mirroring Go
-    let ord_status = if is_fill && !leaves.is_zero() {
-        "1"
+    let status = if event == "5" && order.cum_quantity.is_zero() {
+        "5"
     } else {
         ord_status_to_fix(order.state)
     };
     let mut fields = vec![
-        (tags::ORDER_ID, order.exchange_id.clone()),
-        (tags::EXEC_ID, order.exchange_id.clone()),
-        (tags::EXEC_TRANS_TYPE, "0".to_string()), // required in FIX 4.2: New
-        (tags::EXEC_TYPE, exec_type.to_string()),
-        (tags::ORD_STATUS, ord_status.to_string()),
-        (tags::SIDE, side_to_fix(order.side).to_string()),
-        (tags::LEAVES_QTY, fix_decimal(leaves)),
-        (tags::CUM_QTY, fix_decimal(cum)),
-        (tags::PRICE, fix_decimal(order.price)),
-        (tags::ORDER_QTY, fix_decimal(order.quantity)),
-        (tags::CL_ORD_ID, order.id.to_string()),
-        (tags::SYMBOL, symbol.clone()),
+        (37, order.exchange_id.clone()),
+        (17, exec_id.clone()),
+        (20, "0".into()),
+        (150, event.into()),
+        (39, status.into()),
+        (55, symbol.clone()),
+        (54, side_to_fix(order.side).into()),
+        (38, fix_decimal(order.quantity)),
+        (
+            40,
+            if order.order_type == OrderType::Market {
+                "1"
+            } else {
+                "2"
+            }
+            .into(),
+        ),
+        (
+            151,
+            fix_decimal(if order.state.is_active() {
+                order.remaining
+            } else {
+                Decimal::ZERO
+            }),
+        ),
+        (14, fix_decimal(order.cum_quantity)),
+        (6, fix_decimal(order.avg_price)),
+        (60, transact_time()),
     ];
-    if let (Some(px), Some(qty)) = (last_price, last_quantity) {
-        fields.push((tags::LAST_PX, fix_decimal(px)));
-        fields.push((tags::LAST_QTY, fix_decimal(qty)));
+    if cl_ord_id != 0 {
+        fields.push((11, cl_ord_id.to_string()));
     }
+    if let Some(original) = original {
+        fields.push((41, original.to_string()));
+    }
+    if order.order_type == OrderType::Limit {
+        fields.push((44, fix_decimal(order.price)));
+    }
+    let (px, qty) = fill.unwrap_or((Decimal::ZERO, Decimal::ZERO));
+    fields.push((31, fix_decimal(px)));
+    fields.push((32, fix_decimal(qty)));
     fields
 }
 
-pub fn build_security_definition(req_id: &str, symbol: &str, instrument_id: i64) -> Vec<(u32, String)> {
+pub fn build_security_definition(
+    req_id: &str,
+    symbol: &str,
+    instrument_id: i64,
+) -> Vec<(u32, String)> {
     vec![
         (tags::SECURITY_REQ_ID, req_id.to_string()),
-        (tags::SECURITY_RESPONSE_ID, instrument_id.to_string()),
+        (tags::SECURITY_RESPONSE_ID, message_identifier("security")),
         (tags::TOTAL_NUM_SECURITIES, "1".to_string()), // required in FIX 4.2
-        (tags::SECURITY_RESPONSE_TYPE, "2".to_string()),
+        (tags::SECURITY_RESPONSE_TYPE, "4".to_string()),
         (tags::SYMBOL, symbol.to_string()),
         (tags::SECURITY_ID, instrument_id.to_string()),
+        (22, "8".to_string()),
     ]
 }
 
 pub fn build_mass_quote_ack(quote_id: &str) -> Vec<(u32, String)> {
-    vec![(tags::QUOTE_STATUS, "0".to_string()), (tags::QUOTE_ID, quote_id.to_string())]
+    vec![
+        (tags::QUOTE_STATUS, "0".to_string()),
+        (tags::QUOTE_ID, quote_id.to_string()),
+    ]
 }
 
-// ---- decode ----
+// ---- decode: strict supported FIX 4.2 profile ----
 
 #[derive(Debug)]
 pub enum Inbound {
-    Logon { heart_bt_int: u32 },
+    Logon {
+        heart_bt_int: u32,
+    },
     Logout,
     Heartbeat,
-    TestRequest { test_req_id: String },
+    TestRequest {
+        test_req_id: String,
+    },
     ResendRequest,
-    NewOrderSingle { cl_ord_id: i32, symbol: String, side: Side, order_type: OrderType, price: Decimal, quantity: Decimal },
-    CancelRequest { cl_ord_id: i32, orig_cl_ord_id: i32 },
-    CancelReplace { cl_ord_id: i32, orig_cl_ord_id: i32, price: Decimal, quantity: Decimal },
-    MassQuote { quote_id: String, ack: bool, symbol: String, bid_px: Decimal, bid_qty: Decimal, offer_px: Decimal, offer_qty: Decimal },
-    SecurityDefinition { req_id: String, symbol: String, instrument_id: i64 },
-    BusinessReject { reason: String },
+    SequenceReset {
+        new_seq_no: u64,
+        gap_fill: bool,
+    },
+    SessionReject {
+        reason: String,
+    },
+    NewOrderSingle {
+        cl_ord_id: String,
+        symbol: String,
+        side: Side,
+        order_type: OrderType,
+        price: Decimal,
+        quantity: Decimal,
+    },
+    CancelRequest {
+        cl_ord_id: String,
+        orig_cl_ord_id: String,
+        symbol: String,
+        side: Side,
+    },
+    CancelReplace {
+        cl_ord_id: String,
+        orig_cl_ord_id: String,
+        symbol: String,
+        side: Side,
+        order_type: OrderType,
+        price: Decimal,
+        quantity: Decimal,
+    },
+    CancelReject {
+        cl_ord_id: String,
+        orig_cl_ord_id: String,
+        state: OrderState,
+        reason: String,
+    },
+    MassQuote {
+        quote_id: String,
+        response_level: u8,
+        symbol: String,
+        bid_px: Decimal,
+        bid_qty: Decimal,
+        offer_px: Decimal,
+        offer_qty: Decimal,
+    },
+    QuoteAcknowledgement {
+        quote_id: Option<String>,
+        status: String,
+        reason: String,
+    },
+    SecurityDefinition {
+        req_id: String,
+        symbol: String,
+        instrument_id: i64,
+    },
+    BusinessReject {
+        reason: String,
+    },
     ExecutionReport(ExecReportData),
     Unsupported(String),
 }
@@ -327,7 +467,8 @@ pub enum Inbound {
 #[derive(Debug)]
 pub struct ExecReportData {
     pub exchange_id: String,
-    pub cl_ord_id: i32,
+    pub cl_ord_id: String,
+    pub orig_cl_ord_id: Option<String>,
     pub symbol: String,
     pub state: OrderState,
     pub is_fill: bool,
@@ -339,239 +480,509 @@ pub struct ExecReportData {
     pub last_quantity: Decimal,
 }
 
-pub fn decode(message: &super::frame::FixMessage) -> Result<Inbound, String> {
-    let msg_type = message.msg_type().ok_or("missing 35 MsgType")?;
-    let get = |tag: u32| -> Option<&str> { message.get(tag) };
-    let need = |tag: u32| -> Result<&str, String> {
-        get(tag).ok_or_else(|| format!("missing tag {} in {}", tag, msg_type))
-    };
-    let num = |tag: u32| -> Result<i32, String> { need(tag)?.parse::<i32>().map_err(|e| format!("tag {}: {}", tag, e)) };
-    let dec = |tag: u32| -> Result<Decimal, String> { parse_decimal(need(tag)?) };
-
-    match msg_type {
-        msg_type::LOGON => {
-            let heart = get(tags::HEART_BT_INT).and_then(|v| v.parse().ok()).unwrap_or(30);
-            Ok(Inbound::Logon { heart_bt_int: heart })
-        }
-        msg_type::LOGOUT => Ok(Inbound::Logout),
-        msg_type::HEARTBEAT => Ok(Inbound::Heartbeat),
-        msg_type::TEST_REQUEST => Ok(Inbound::TestRequest { test_req_id: need(tags::TEST_REQ_ID)?.to_string() }),
-        msg_type::RESEND_REQUEST => Ok(Inbound::ResendRequest),
-        msg_type::NEW_ORDER_SINGLE => {
-            let side = side_from_fix(need(tags::SIDE)?)?;
-            let order_type = match need(tags::ORD_TYPE)? {
-                "1" => OrderType::Limit,
-                "2" => OrderType::Market,
-                other => return Err(format!("unsupported OrdType {}", other)),
-            };
-            Ok(Inbound::NewOrderSingle {
-                cl_ord_id: num(tags::CL_ORD_ID)?,
-                symbol: need(tags::SYMBOL)?.to_string(),
-                side,
-                order_type,
-                price: get(tags::PRICE).and_then(|v| parse_decimal(v).ok()).unwrap_or(Decimal::ZERO),
-                quantity: dec(tags::ORDER_QTY)?,
-            })
-        }
-        msg_type::ORDER_CANCEL_REQUEST => {
-            // the Go acceptor cancels by ClOrdID (tag 11), falling back to 41;
-            // spec-style clients send a fresh 11 and point 41 at the order
-            let cl_ord_id = match get(tags::CL_ORD_ID) {
-                Some(v) => v.parse::<i32>().map_err(|e| format!("tag 11: {}", e))?,
-                None => num(tags::ORIG_CL_ORD_ID)?,
-            };
-            let orig_cl_ord_id = get(tags::ORIG_CL_ORD_ID)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(cl_ord_id);
-            Ok(Inbound::CancelRequest { cl_ord_id, orig_cl_ord_id })
-        }
-        msg_type::ORDER_CANCEL_REPLACE_REQUEST => {
-            let cl_ord_id = num(tags::CL_ORD_ID)?;
-            let orig_cl_ord_id = get(tags::ORIG_CL_ORD_ID)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(cl_ord_id);
-            Ok(Inbound::CancelReplace { cl_ord_id, orig_cl_ord_id, price: dec(tags::PRICE)?, quantity: dec(tags::ORDER_QTY)? })
-        }
-        msg_type::MASS_QUOTE => {
-            let sets = need(tags::NO_QUOTE_SETS)?;
-            if sets != "1" {
-                return Err(format!("only 1 quote set supported, got {}", sets));
-            }
-            let entries = need(tags::NO_QUOTE_ENTRIES)?;
-            if entries != "1" {
-                return Err(format!("only 1 quote supported, got {}", entries));
-            }
-            let ack = get(tags::QUOTE_RESPONSE_LEVEL).map(|v| v == "1").unwrap_or(false);
-            Ok(Inbound::MassQuote {
-                quote_id: need(tags::QUOTE_ID)?.to_string(),
-                ack,
-                symbol: need(tags::SYMBOL)?.to_string(),
-                bid_px: dec(tags::BID_PX)?,
-                bid_qty: dec(tags::BID_SIZE)?,
-                offer_px: dec(tags::OFFER_PX)?,
-                offer_qty: dec(tags::OFFER_SIZE)?,
-            })
-        }
-        msg_type::SECURITY_DEFINITION => Ok(Inbound::SecurityDefinition {
-            req_id: need(tags::SECURITY_REQ_ID)?.to_string(),
-            instrument_id: need(tags::SECURITY_ID)?.parse().map_err(|e| format!("tag 48: {}", e))?,
-            symbol: need(tags::SYMBOL)?.to_string(),
-        }),
-        msg_type::EXECUTION_REPORT => {
-            let is_fill = matches!(need(tags::EXEC_TYPE)?, "1" | "2"); // FIX 4.2: 1=Partial fill, 2=Fill
-            Ok(Inbound::ExecutionReport(ExecReportData {
-                exchange_id: need(tags::ORDER_ID)?.to_string(),
-                cl_ord_id: num(tags::CL_ORD_ID)?,
-                symbol: need(tags::SYMBOL)?.to_string(),
-                state: ord_status_from_fix(need(tags::ORD_STATUS)?)?,
-                is_fill,
-                side: side_from_fix(need(tags::SIDE)?)?,
-                price: dec(tags::PRICE)?,
-                quantity: dec(tags::ORDER_QTY)?,
-                remaining: dec(tags::LEAVES_QTY)?,
-                last_price: get(tags::LAST_PX).and_then(|v| parse_decimal(v).ok()).unwrap_or(Decimal::ZERO),
-                last_quantity: get(tags::LAST_QTY).and_then(|v| parse_decimal(v).ok()).unwrap_or(Decimal::ZERO),
-            }))
-        }
-        msg_type::BUSINESS_MESSAGE_REJECT => Ok(Inbound::BusinessReject {
-            reason: get(tags::TEXT).unwrap_or("").to_string(),
-        }),
-        other => Ok(Inbound::Unsupported(other.to_string())),
+fn validate_timestamp(value: &str) -> Result<(), String> {
+    if value.len() != 17 && value.len() != 21 {
+        return Err("FIX 4.2 timestamp requires seconds or milliseconds".into());
     }
+    chrono::NaiveDateTime::parse_from_str(
+        value,
+        if value.len() == 17 {
+            "%Y%m%d-%H:%M:%S"
+        } else {
+            "%Y%m%d-%H:%M:%S%.3f"
+        },
+    )
+    .map(|_| ())
+    .map_err(|_| "invalid UTCTimestamp".into())
 }
 
-// silence unused import if fields vec not used in some builds
-#[allow(unused)]
-fn _assert_fields_type(fields: &[(u32, String)]) {}
+fn validate_profile(message: &super::frame::FixMessage, kind: &str) -> Result<(), String> {
+    let (required, allowed): (&[u32], &[u32]) = match kind {
+        "A" => (&[98, 108], &[98, 108, 141]),
+        "0" => (&[], &[112]),
+        "1" => (&[112], &[112]),
+        "2" => (&[7, 16], &[7, 16]),
+        "3" => (&[45], &[45, 371, 372, 373, 58]),
+        "4" => (&[36], &[36, 123]),
+        "5" => (&[], &[58]),
+        "D" => (
+            &[11, 21, 55, 54, 60, 40, 38],
+            &[11, 21, 55, 54, 60, 40, 38, 44, 59],
+        ),
+        "F" => (&[11, 41, 55, 54, 60], &[11, 41, 55, 54, 60, 38]),
+        "G" => (
+            &[11, 41, 21, 55, 54, 60, 40, 38],
+            &[11, 41, 21, 55, 54, 60, 40, 38, 44, 59],
+        ),
+        "8" => (
+            &[37, 17, 20, 150, 39, 55, 54, 151, 14, 6],
+            &[
+                37, 17, 20, 150, 39, 55, 54, 151, 14, 6, 11, 41, 38, 40, 44, 31, 32, 60, 103, 58,
+            ],
+        ),
+        "9" => (&[37, 11, 41, 39, 434], &[37, 11, 41, 39, 434, 102, 58, 60]),
+        "i" => (
+            &[117, 296, 302, 311, 304, 295, 299, 55],
+            &[
+                117, 301, 296, 302, 311, 304, 295, 299, 55, 132, 133, 134, 135,
+            ],
+        ),
+        "b" => (&[297], &[117, 297, 300, 58]),
+        "d" => (&[320, 322, 323, 393], &[320, 322, 323, 393, 55, 48, 22]),
+        "j" => (&[372, 380], &[45, 372, 379, 380, 58]),
+        _ => return Ok(()),
+    };
+    let header = [35, 34, 49, 56, 52, 43, 122];
+    let mut seen = std::collections::HashSet::new();
+    for (tag, value) in &message.fields {
+        if !seen.insert(*tag) {
+            return Err(format!("duplicate tag {tag}"));
+        }
+        if !header.contains(tag) && !allowed.contains(tag) {
+            return Err(format!("unsupported tag {tag} for message {kind}"));
+        }
+        if value.is_empty() {
+            return Err(format!("empty tag {tag}"));
+        }
+        let valid = match tag {
+            373 => matches!(
+                value.as_str(),
+                "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10" | "11"
+            ),
+            380 => matches!(value.as_str(), "0" | "1" | "2" | "3" | "4" | "5"),
+            102 => matches!(value.as_str(), "0" | "1" | "2" | "3"),
+            300 => matches!(
+                value.as_str(),
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+            ),
+            _ => true,
+        };
+        if !valid {
+            return Err(format!("invalid FIX 4.2 enumeration tag {tag}"));
+        }
+    }
+    for tag in required {
+        if !seen.contains(tag) {
+            return Err(format!("missing required tag {tag} in {kind}"));
+        }
+    }
+    if let Some(t) = message.get(60) {
+        validate_timestamp(t)?;
+    }
+    if matches!(kind, "D" | "G") {
+        if message.get(21) != Some("1") {
+            return Err("only automated private execution HandlInst=1 is supported".into());
+        }
+        if message.get(59).unwrap_or("0") != "0" {
+            return Err("only DAY TimeInForce=0 is supported".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn decode(message: &super::frame::FixMessage) -> Result<Inbound, String> {
+    let kind = message.msg_type().ok_or("missing MsgType(35)")?;
+    validate_profile(message, kind)?;
+    let get = |tag| message.get(tag);
+    let need = |tag| get(tag).ok_or_else(|| format!("missing tag {tag}"));
+    let text = |tag| need(tag).map(str::to_string);
+    let dec = |tag| parse_decimal(need(tag)?);
+    let positive = |tag| -> Result<Decimal, String> {
+        let value = dec(tag)?;
+        if value <= Decimal::ZERO {
+            return Err(format!("tag {tag} must be positive"));
+        }
+        Ok(value)
+    };
+    let natural = |tag| -> Result<u64, String> {
+        let value = need(tag)?;
+        if !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("invalid integer tag {tag}"));
+        }
+        value
+            .parse::<u64>()
+            .map_err(|_| format!("invalid integer tag {tag}"))
+    };
+    let boolean = |tag, default| -> Result<bool, String> {
+        match get(tag) {
+            None => Ok(default),
+            Some("Y") => Ok(true),
+            Some("N") => Ok(false),
+            _ => Err(format!("invalid boolean tag {tag}")),
+        }
+    };
+    let order_type = || -> Result<OrderType, String> {
+        match need(40)? {
+            "1" => Ok(OrderType::Market),
+            "2" => Ok(OrderType::Limit),
+            _ => Err("unsupported OrdType(40)".into()),
+        }
+    };
+    let order_price = |typ| -> Result<Decimal, String> {
+        if typ == OrderType::Limit {
+            positive(44)
+        } else {
+            get(44)
+                .map(parse_decimal)
+                .transpose()
+                .map(|x| x.unwrap_or(Decimal::ZERO))
+        }
+    };
+    match kind {
+        "A" => {
+            if need(98)? != "0" {
+                return Err("only EncryptMethod=0 is supported".into());
+            }
+            boolean(141, false)?;
+            let heart = u32::try_from(natural(108)?).map_err(|_| "invalid HeartBtInt")?;
+            if heart == 0 {
+                return Err("HeartBtInt must be positive in this profile".into());
+            }
+            Ok(Inbound::Logon {
+                heart_bt_int: heart,
+            })
+        }
+        "0" => Ok(Inbound::Heartbeat),
+        "1" => Ok(Inbound::TestRequest {
+            test_req_id: text(112)?,
+        }),
+        "2" => {
+            let start = natural(7)?;
+            let end = natural(16)?;
+            if start == 0 || (end != 0 && end < start) {
+                return Err("invalid ResendRequest range".into());
+            }
+            Ok(Inbound::ResendRequest)
+        }
+        "3" => {
+            natural(45)?;
+            Ok(Inbound::SessionReject {
+                reason: get(58).unwrap_or("").into(),
+            })
+        }
+        "4" => {
+            let n = natural(36)?;
+            if n == 0 {
+                return Err("NewSeqNo must be positive".into());
+            }
+            Ok(Inbound::SequenceReset {
+                new_seq_no: n,
+                gap_fill: boolean(123, false)?,
+            })
+        }
+        "5" => Ok(Inbound::Logout),
+        "D" => {
+            let typ = order_type()?;
+            Ok(Inbound::NewOrderSingle {
+                cl_ord_id: text(11)?,
+                symbol: text(55)?,
+                side: side_from_fix(need(54)?)?,
+                order_type: typ,
+                price: order_price(typ)?,
+                quantity: positive(38)?,
+            })
+        }
+        "F" => {
+            if get(38).is_some() {
+                positive(38)?;
+            }
+            Ok(Inbound::CancelRequest {
+                cl_ord_id: text(11)?,
+                orig_cl_ord_id: text(41)?,
+                symbol: text(55)?,
+                side: side_from_fix(need(54)?)?,
+            })
+        }
+        "G" => {
+            let typ = order_type()?;
+            Ok(Inbound::CancelReplace {
+                cl_ord_id: text(11)?,
+                orig_cl_ord_id: text(41)?,
+                symbol: text(55)?,
+                side: side_from_fix(need(54)?)?,
+                order_type: typ,
+                price: order_price(typ)?,
+                quantity: positive(38)?,
+            })
+        }
+        "9" => {
+            if !matches!(need(434)?, "1" | "2") {
+                return Err("invalid CxlRejResponseTo".into());
+            }
+            Ok(Inbound::CancelReject {
+                cl_ord_id: text(11)?,
+                orig_cl_ord_id: text(41)?,
+                state: ord_status_from_fix(need(39)?)?,
+                reason: get(58).unwrap_or("").into(),
+            })
+        }
+        "i" => {
+            if need(296)? != "1" || need(295)? != "1" || need(304)? != "1" {
+                return Err("only a single complete quote set and entry is supported".into());
+            }
+            // FIX repeating groups must preserve the dictionary field order.
+            let order = [302, 311, 304, 295, 299, 55, 132, 133, 134, 135];
+            let mut previous = None;
+            let start = message.fields.iter().position(|(t, _)| *t == 296).unwrap();
+            for (tag, _) in &message.fields[start + 1..] {
+                let pos = order
+                    .iter()
+                    .position(|t| t == tag)
+                    .ok_or("field outside supported MassQuote group")?;
+                if previous.is_some_and(|prev| pos <= prev) {
+                    return Err("MassQuote group fields out of order".into());
+                }
+                previous = Some(pos);
+            }
+            let level = match get(301).unwrap_or("0") {
+                "0" => 0,
+                "1" => 1,
+                "2" => 2,
+                _ => return Err("invalid QuoteResponseLevel".into()),
+            };
+            // This profile maintains a two-sided quote snapshot. Missing sides
+            // are withdrawals, as are explicit zero price/size values.
+            let quote_value = |tag| -> Result<Decimal, String> {
+                let value = get(tag)
+                    .map(parse_decimal)
+                    .transpose()?
+                    .unwrap_or(Decimal::ZERO);
+                if value < Decimal::ZERO {
+                    return Err(format!("negative quote tag {tag}"));
+                }
+                Ok(value)
+            };
+            Ok(Inbound::MassQuote {
+                quote_id: text(117)?,
+                response_level: level,
+                symbol: text(55)?,
+                bid_px: quote_value(132)?,
+                bid_qty: quote_value(134)?,
+                offer_px: quote_value(133)?,
+                offer_qty: quote_value(135)?,
+            })
+        }
+        "d" => {
+            if need(323)? != "4" {
+                return Err("only SecurityDefinition list responses are supported".into());
+            }
+            natural(393)?;
+            Ok(Inbound::SecurityDefinition {
+                req_id: text(320)?,
+                symbol: text(55)?,
+                instrument_id: need(48)?
+                    .parse()
+                    .map_err(|_| "invalid SecurityID for supported instrument profile")?,
+            })
+        }
+        "8" => {
+            if need(20)? != "0" {
+                return Err("only new execution transactions are supported".into());
+            }
+            if !matches!(need(150)?, "0" | "1" | "2" | "4" | "5" | "8" | "C") {
+                return Err("unsupported ExecType".into());
+            }
+            if matches!(need(150)?, "4" | "5") && get(11).is_some() && get(41).is_none() {
+                // Unsolicited cancellations (for example market remainder)
+                // need not identify a cancel request. Replacements always do.
+                if need(150)? == "5" {
+                    return Err("replacement missing OrigClOrdID".into());
+                }
+            }
+            let is_fill = matches!(need(150)?, "1" | "2");
+            let cum = dec(14)?;
+            let remaining = dec(151)?;
+            let avg = dec(6)?;
+            if cum < Decimal::ZERO || remaining < Decimal::ZERO || avg < Decimal::ZERO {
+                return Err("negative execution aggregate".into());
+            }
+            let last_price = if is_fill {
+                positive(31)?
+            } else {
+                get(31)
+                    .map(parse_decimal)
+                    .transpose()?
+                    .unwrap_or(Decimal::ZERO)
+            };
+            let last_quantity = if is_fill {
+                positive(32)?
+            } else {
+                get(32)
+                    .map(parse_decimal)
+                    .transpose()?
+                    .unwrap_or(Decimal::ZERO)
+            };
+            Ok(Inbound::ExecutionReport(ExecReportData {
+                exchange_id: text(37)?,
+                cl_ord_id: get(11).unwrap_or("").into(),
+                orig_cl_ord_id: get(41).map(str::to_string),
+                symbol: text(55)?,
+                state: ord_status_from_fix(need(39)?)?,
+                is_fill,
+                side: side_from_fix(need(54)?)?,
+                price: get(44)
+                    .map(parse_decimal)
+                    .transpose()?
+                    .unwrap_or(Decimal::ZERO),
+                quantity: get(38)
+                    .map(parse_decimal)
+                    .transpose()?
+                    .unwrap_or(cum + remaining),
+                remaining,
+                last_price,
+                last_quantity,
+            }))
+        }
+        "j" => {
+            natural(380)?;
+            Ok(Inbound::BusinessReject {
+                reason: get(58).unwrap_or("").into(),
+            })
+        }
+        "b" => {
+            if !matches!(need(297)?, "0" | "1" | "2" | "3" | "4" | "5") {
+                return Err("invalid QuoteStatus".into());
+            }
+            // A supported informational response, not a request to execute.
+            Ok(Inbound::QuoteAcknowledgement {
+                quote_id: get(117).map(str::to_string),
+                status: text(297)?,
+                reason: get(58).unwrap_or("").into(),
+            })
+        }
+        other => Ok(Inbound::Unsupported(other.into())),
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use super::super::frame;
     use super::*;
+    use crate::fix::frame::{parse_body, FixMessage};
+    fn message(body: &str) -> FixMessage {
+        FixMessage {
+            begin_string: "FIX.4.2".into(),
+            fields: parse_body(&body.replace('|', "\x01")),
+            raw: String::new(),
+        }
+    }
 
     #[test]
-    fn test_new_order_single_roundtrip() {
-        let fields = build_new_order_single(
-            OrderIdForWire("7".to_string()),
-            "IBM",
+    fn standard_ordtype_is_not_a_self_roundtrip() {
+        let base = "35=D|11=order-alpha|21=1|55=AAPL|54=1|60=20260914-01:02:03|38=10|";
+        match decode(&message(&format!("{base}40=2|44=100|"))).unwrap() {
+            Inbound::NewOrderSingle {
+                order_type,
+                cl_ord_id,
+                ..
+            } => {
+                assert_eq!(order_type, OrderType::Limit);
+                assert_eq!(cl_ord_id, "order-alpha");
+            }
+            _ => panic!(),
+        }
+        match decode(&message(&format!("{base}40=1|"))).unwrap() {
+            Inbound::NewOrderSingle { order_type, .. } => assert_eq!(order_type, OrderType::Market),
+            _ => panic!(),
+        }
+        assert!(build_new_order_single(
+            OrderIdForWire("1".into()),
+            "AAPL",
             Side::Buy,
             OrderType::Limit,
-            "99.5".parse().unwrap(),
-            "10".parse().unwrap(),
+            Decimal::ONE,
+            Decimal::ONE
+        )
+        .contains(&(40, "2".into())));
+    }
+
+    #[test]
+    fn invalid_supported_orders_are_rejected() {
+        let base = "35=D|11=a|21=1|55=AAPL|54=1|60=20260914-01:02:03|40=2|";
+        for suffix in [
+            "38=10|",
+            "38=-1|44=100|",
+            "38=1|44=wrong|",
+            "38=1|44=100|59=4|",
+            "38=1|44=100|11=duplicate|",
+            "38=1|44=100|18=1|",
+        ] {
+            assert!(
+                decode(&message(&format!("{base}{suffix}"))).is_err(),
+                "accepted {suffix}"
+            );
+        }
+        assert!(decode(&message("35=G|11=b|55=AAPL|54=1|40=2|38=1|44=1|")).is_err());
+    }
+
+    #[test]
+    fn report_includes_average_and_supplied_execution_identity() {
+        let mut order = crate::core::order::Order::limit(
+            "s",
+            1,
+            1,
+            Side::Buy,
+            Decimal::from(100),
+            Decimal::from(10),
+            1,
         );
-        let bytes = frame::frame("FIX.4.2", msg_type::NEW_ORDER_SINGLE, 3, "CLIENT", "GOX", &fields);
-        let mut reader = std::io::Cursor::new(bytes);
-        let message = frame::read_message(&mut reader).unwrap().unwrap();
-        match decode(&message).unwrap() {
-            Inbound::NewOrderSingle { cl_ord_id, symbol, side, order_type, price, quantity } => {
-                assert_eq!(cl_ord_id, 7);
-                assert_eq!(symbol, "IBM");
-                assert_eq!(side, Side::Buy);
-                assert_eq!(order_type, OrderType::Limit);
-                assert_eq!(price, "99.5".parse::<Decimal>().unwrap());
-                assert_eq!(quantity, "10".parse::<Decimal>().unwrap());
-            }
-            other => panic!("unexpected {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_execution_report_fill() {
-        let order = crate::core::order::Order {
-            session_id: "s".to_string(),
-            id: 5,
-            exchange_id: "12".to_string(),
-            instrument_id: 1,
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            price: "100".parse().unwrap(),
-            quantity: "10".parse().unwrap(),
-            remaining: "4".parse().unwrap(),
-            state: OrderState::PartialFill,
-            arrival: 1,
+        order.exchange_id = "ex-1".into();
+        order.cum_quantity = Decimal::from(4);
+        order.remaining = Decimal::from(6);
+        order.avg_price = Decimal::from(100);
+        order.state = OrderState::PartialFill;
+        let report = Report::Status {
+            order,
+            symbol: "AAPL".into(),
+            cl_ord_id: 2,
+            exec_id: "event-unique".into(),
+            exec_type: ExecType::Replaced,
+            orig_cl_ord_id: Some(1),
         };
-        let report = Report::Fill { order, symbol: "IBM".to_string(), last_price: "100".parse().unwrap(), last_quantity: "6".parse().unwrap() };
         let fields = build_execution_report(&report);
-        let bytes = frame::frame("FIX.4.2", msg_type::EXECUTION_REPORT, 9, "GOX", "CLIENT", &fields);
-        let wire = String::from_utf8(bytes.clone()).unwrap();
-        let mut reader = std::io::Cursor::new(bytes);
-        let message = frame::read_message(&mut reader).unwrap().unwrap();
-        match decode(&message).unwrap() {
-            Inbound::ExecutionReport(data) => {
-                assert!(data.is_fill);
-                assert_eq!(data.cl_ord_id, 5);
-                assert_eq!(data.remaining, "4".parse::<Decimal>().unwrap());
-                assert_eq!(data.last_quantity, "6".parse::<Decimal>().unwrap());
-                assert_eq!(data.state, OrderState::PartialFill);
-                assert_eq!(data.exchange_id, "12");
-            }
-            other => panic!("unexpected {:?}", other),
+        for pair in [
+            (6, "100"),
+            (17, "event-unique"),
+            (150, "5"),
+            (39, "1"),
+            (11, "2"),
+            (41, "1"),
+            (14, "4"),
+            (151, "6"),
+        ] {
+            assert!(fields.contains(&(pair.0, pair.1.into())));
         }
-        // FIX 4.2 wire values: 150=1 (Partial fill) and 20=0 (ExecTransType New)
-        let text = wire;
-        assert!(text.contains("150=1"), "ExecType must be 1 on partial fill");
-        assert!(text.contains("20=0"), "ExecTransType must be 0");
     }
 
     #[test]
-    fn test_mass_quote_roundtrip() {
-        let fields = build_mass_quote("IBM", "99.75".parse().unwrap(), "10".parse().unwrap(), "100".parse().unwrap(), "10".parse().unwrap());
-        let bytes = frame::frame("FIX.4.2", msg_type::MASS_QUOTE, 4, "MM", "GOX", &fields);
-        let mut reader = std::io::Cursor::new(bytes);
-        let message = frame::read_message(&mut reader).unwrap().unwrap();
-        match decode(&message).unwrap() {
-            Inbound::MassQuote { quote_id, ack, symbol, bid_px, bid_qty, offer_px, offer_qty } => {
-                assert_eq!(quote_id, "1");
-                assert!(!ack);
-                assert_eq!(symbol, "IBM");
-                assert_eq!(bid_px, "99.75".parse::<Decimal>().unwrap());
-                assert_eq!(bid_qty, "10".parse::<Decimal>().unwrap());
-                assert_eq!(offer_px, "100".parse::<Decimal>().unwrap());
-                assert_eq!(offer_qty, "10".parse::<Decimal>().unwrap());
+    fn quote_response_level_and_order_are_standard() {
+        let m = message("35=i|117=q|301=2|296=1|302=s|311=AAPL|304=1|295=1|299=e|55=AAPL|132=99|133=101|134=10|135=10|");
+        assert!(matches!(
+            decode(&m).unwrap(),
+            Inbound::MassQuote {
+                response_level: 2,
+                ..
             }
-            other => panic!("unexpected {:?}", other),
-        }
+        ));
+        let bad =
+            message("35=i|117=q|296=1|302=s|311=AAPL|304=1|295=1|299=e|55=AAPL|134=10|132=99|");
+        assert!(decode(&bad).is_err());
     }
-}
 
-#[test]
-fn test_fix42_exectype_mapping() {
-    use crate::core::exchange::NewOrder;
-    let mk = |state| crate::core::order::Order {
-        session_id: "s".into(),
-        id: 1,
-        exchange_id: "9".into(),
-        instrument_id: 1,
-        side: Side::Buy,
-        order_type: OrderType::Limit,
-        price: "100".parse().unwrap(),
-        quantity: "10".parse().unwrap(),
-        remaining: "10".parse().unwrap(),
-        state,
-        arrival: 1,
-    };
-    // booked -> ExecType 0 (New)
-    let fields = build_execution_report(&Report::Status { order: mk(OrderState::Booked), symbol: "IBM".into() });
-    assert!(fields.contains(&(tags::EXEC_TYPE, "0".to_string())));
-    // cancelled -> ExecType 4
-    let mut o = mk(OrderState::Cancelled);
-    o.remaining = Decimal::ZERO;
-    let fields = build_execution_report(&Report::Status { order: o.clone(), symbol: "IBM".into() });
-    assert!(fields.contains(&(tags::EXEC_TYPE, "4".to_string())));
-    assert!(fields.contains(&(tags::ORD_STATUS, "4".to_string())));
-    // partial fill -> ExecType 1 with OrdStatus 1
-    let mut o = mk(OrderState::PartialFill);
-    o.remaining = "4".parse().unwrap();
-    let fields = build_execution_report(&Report::Fill {
-        order: o.clone(), symbol: "IBM".into(), last_price: "100".parse().unwrap(), last_quantity: "6".parse().unwrap(),
-    });
-    assert!(fields.contains(&(tags::EXEC_TYPE, "1".to_string())));
-    // full fill -> ExecType 2 with OrdStatus 2
-    let mut o = mk(OrderState::Filled);
-    o.remaining = Decimal::ZERO;
-    let fields = build_execution_report(&Report::Fill {
-        order: o.clone(), symbol: "IBM".into(), last_price: "100".parse().unwrap(), last_quantity: "10".parse().unwrap(),
-    });
-    assert!(fields.contains(&(tags::EXEC_TYPE, "2".to_string())));
-    assert!(fields.contains(&(tags::ORD_STATUS, "2".to_string())));
+    #[test]
+    fn reject_messages_require_fix42_fields() {
+        assert!(decode(&message("35=j|58=oops|")).is_err());
+        assert!(matches!(
+            decode(&message("35=j|372=D|380=0|58=oops|")).unwrap(),
+            Inbound::BusinessReject { .. }
+        ));
+        assert!(matches!(
+            decode(&message("35=3|45=2|373=1|58=oops|")).unwrap(),
+            Inbound::SessionReject { .. }
+        ));
+    }
+
+    #[test]
+    fn decimal_wire_precision_is_preserved() {
+        assert_eq!(fix_decimal("1.12345678".parse().unwrap()), "1.12345678");
+    }
 }

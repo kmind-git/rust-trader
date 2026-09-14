@@ -1,0 +1,16 @@
+[Unit]
+Description=Rust Trader Exchange (FIX 4.2 acceptor + REST)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gotrader
+Group=gotrader
+WorkingDirectory=/opt/rust-trader
+ExecStart=/opt/rust-trader/exchange --server
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
