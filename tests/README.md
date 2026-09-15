@@ -36,3 +36,20 @@ or an implementation of every conditional rule in the complete dictionary.
 
 `cargo test` 包含有界队列溢出、关闭 TCP 连接、盘口增量总量/索引一致性及 REST 快照独立性检查。
 `cargo run --release --example book_bench` 测量 20000 订单的插入、500 次盘口快照及逆序撤单。方法、前后结果与限制见 [性能优化验证](../docs/performance.md)。
+
+行情 ArcSwap 改造增加 `tests/market_data.rs` 并发读取测试，以及核心的改单、断连、到期快照合并检查。`cargo test --locked --offline` 会一并执行。REST 单元测试覆盖持有 Engine 锁期间仍可完成行情路由。
+
+`cargo run --locked --offline --release --example market_snapshot_bench` 比较同一最终引擎上的旧式锁内深复制与新快照读取，输出 1/4 读者、5 次测量的原始数据。它不包含 JSON/TCP，不是完整版本的端到端速度对比。机制和兼容范围见 [行情快照说明](D:/projects/zcodeworkspace/rust-trader/docs/market-data-snapshots.md)。
+
+## FIX 回报延迟与输入缓冲回归
+
+```text
+cargo build --locked --offline
+python tests/fix_delivery.py
+cargo build --locked --offline --release --bin exchange
+python tests/fix_delivery.py --release
+```
+
+使用独立 loopback 进程、端口和 FIX42 字典校验器，五轮验证输入空闲的 MAKER 与主动下单的 TAKER 都能收到成交回报。双方第一次将 Logon 与首单合并发送，验证握手预读数据保留、Logon 回包顺序、成交数量/价格、连续序号、唯一 ExecID，以及 Logout 后不再发送消息并关闭连接。
+
+2 秒接收期限仅用于捕获旧路径接近 10 秒的等待，不能用作生产 SLO。打印的每轮耗时含 Python、socket 与校验成本，配置、日志及 `diagnostic.json` 保存在 `target/fix-delivery/<run-id>/`；进程在退出时清理。输入跨超时续读、超限拒绝、模拟 Read 合并、单方出站满载及最终 Logout 顺序另由 Rust 测试覆盖。机制与限制见 [FIX 回报路径说明](../docs/fix-delivery.md)。

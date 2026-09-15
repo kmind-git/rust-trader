@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+use crate::market_data::{MarketDataPublisher, MarketDataReader};
 use crate::queue as mpsc;
+use std::collections::{BTreeMap, HashMap};
 
 use chrono::{NaiveDate, Utc};
 use rust_decimal::Decimal;
@@ -83,6 +84,19 @@ pub enum Report {
     },
 }
 
+/// An application-provided, bounded and nonblocking report destination.
+/// Implementations must not perform network/disk IO or wait for capacity:
+/// delivery runs in the Engine's serialized command path to preserve order.
+pub(crate) trait ReportSink: Send + Sync {
+    fn try_send(&self, report: Report) -> Result<(), std::sync::mpsc::TrySendError<Report>>;
+}
+
+impl ReportSink for mpsc::Sender<Report> {
+    fn try_send(&self, report: Report) -> Result<(), std::sync::mpsc::TrySendError<Report>> {
+        self.send(report)
+    }
+}
+
 /// an incoming order request from a client
 #[derive(Clone, Debug)]
 pub struct NewOrder {
@@ -105,13 +119,12 @@ struct QuotePair {
 struct Session {
     orders: HashMap<OrderId, Order>,
     quotes: HashMap<i64, QuotePair>,
-    sender: mpsc::Sender<Report>,
+    sender: Box<dyn ReportSink>,
 }
 
-/// the exchange engine. A single global lock guards all state (books, sessions,
-/// caches); client threads lock per command and communicate results back over
-/// per-session channels. This mirrors the Go implementation's observable
-/// behavior while keeping ownership single-threaded inside the lock.
+/// The exchange engine serializes trading state under its caller's lock.
+/// Complete per-instrument snapshots are published independently for readers;
+/// querying market data does not acquire the trading lock.
 pub struct Engine {
     instruments: InstrumentMap,
     books: HashMap<i64, OrderBook>,
@@ -121,9 +134,12 @@ pub struct Engine {
     next_exec_id: u64,
     next_arrival: u64,
     sequence: u64,
-    book_cache: HashMap<i64, Book>,
+    market_data: MarketDataPublisher,
+    pending_market_data: HashMap<i64, u64>,
     stats_cache: HashMap<i64, Statistics>,
     order_dates: HashMap<(String, OrderId), NaiveDate>,
+    #[cfg(test)]
+    snapshot_builds: usize,
 }
 
 impl Engine {
@@ -137,23 +153,40 @@ impl Engine {
             next_exec_id: 0,
             next_arrival: 0,
             sequence: 0,
-            book_cache: HashMap::new(),
+            market_data: MarketDataPublisher::new(),
+            pending_market_data: HashMap::new(),
             stats_cache: HashMap::new(),
             order_dates: HashMap::new(),
+            #[cfg(test)]
+            snapshot_builds: 0,
         }
     }
 
     pub fn load_instruments(&mut self, path: &str) -> std::io::Result<()> {
-        self.instruments.load(path)
+        let result = self.instruments.load(path);
+        // A read error may leave successfully parsed instruments in the map.
+        // Publish the same registry the Engine exposes, including that case.
+        let symbols = self.instruments.all_symbols();
+        let instruments = &self.instruments;
+        self.market_data.register(
+            symbols
+                .iter()
+                .filter_map(|symbol| instruments.get_by_symbol(symbol)),
+        );
+        result
     }
 
     // --- sessions ---
 
     pub fn register_session(&mut self, id: &str, sender: mpsc::Sender<Report>) {
+        self.register_session_sink(id, sender);
+    }
+
+    pub(crate) fn register_session_sink(&mut self, id: &str, sender: impl ReportSink + 'static) {
         let session = Session {
             orders: HashMap::new(),
             quotes: HashMap::new(),
-            sender,
+            sender: Box::new(sender),
         };
         self.sessions.insert(id.to_string(), session);
     }
@@ -176,8 +209,7 @@ impl Engine {
                     order_count += 1;
                 }
             }
-            let book = self.build_book(entry.instrument_id);
-            self.record_market_data(book, &[]);
+            self.record_market_data(entry.instrument_id, &[]);
         }
         for (instrument_id, pair) in session.quotes {
             for leg in [pair.bid, pair.ask] {
@@ -192,9 +224,9 @@ impl Engine {
                     }
                 }
             }
-            let book = self.build_book(instrument_id);
-            self.record_market_data(book, &[]);
+            self.record_market_data(instrument_id, &[]);
         }
+        self.publish_market_data();
         log::info!(
             "session {} disconnected, cancelled {} orders {} quotes",
             session_id,
@@ -211,6 +243,8 @@ impl Engine {
         }
         let id = self.instruments.next_id();
         self.instruments.put(Instrument::new(id, symbol));
+        self.market_data
+            .register(std::iter::once(self.instruments.get_by_id(id).unwrap()));
         id
     }
 
@@ -252,9 +286,10 @@ impl Engine {
             order.state = OrderState::Expired;
             order.remaining = Decimal::ZERO;
             self.sync_record(&order);
-            self.record_book(order.instrument_id);
+            self.record_market_data(order.instrument_id, &[]);
             self.send_status_for(order, id, ExecType::Expired, None);
         }
+        self.publish_market_data();
     }
 
     /// mirrors exchange.CreateOrder
@@ -308,8 +343,8 @@ impl Engine {
             .insert((session_id.to_string(), order.id), Utc::now().date_naive());
 
         let (mut trades, final_state) = self.add_to_book(order);
-        let book = self.build_book(new.instrument_id);
-        self.record_market_data(book, &trades);
+        self.record_market_data(new.instrument_id, &trades);
+        self.publish_market_data();
         self.send_trade_reports(&mut trades);
         if let Some(final_order) = &final_state {
             self.sync_record(&final_order.clone());
@@ -413,7 +448,9 @@ impl Engine {
                 return Ok(());
             }
         };
-        self.record_book(instrument_id);
+        // Preserve the logical removal version without constructing an
+        // intermediate full book that will immediately be superseded.
+        self.record_market_data(instrument_id, &[]);
 
         // A replacement is one FIX event.  Do not emit a preceding Cancelled
         // event for the old ClOrdID: the Replaced report carries OrigClOrdID.
@@ -450,12 +487,13 @@ impl Engine {
         // A replacement with no remaining quantity has no book entry and no
         // matching work.  It still receives the Replaced event above.
         if order.remaining.is_zero() {
+            self.publish_market_data();
             return Ok(());
         }
 
         let (mut trades, final_state) = self.add_to_book(order);
-        let book = self.build_book(instrument_id);
-        self.record_market_data(book, &trades);
+        self.record_market_data(instrument_id, &trades);
+        self.publish_market_data();
         self.send_trade_reports(&mut trades);
         if let Some(final_order) = &final_state {
             self.sync_record(&final_order.clone());
@@ -516,10 +554,8 @@ impl Engine {
             .unwrap()
             .orders
             .insert(orig_id, removed.clone());
-        {
-            let book = self.build_book(instrument_id);
-            self.record_market_data(book, &[]);
-        }
+        self.record_market_data(instrument_id, &[]);
+        self.publish_market_data();
         self.send_status_for(removed, cl_ord_id, ExecType::Cancelled, Some(orig_id));
         Ok(())
     }
@@ -612,17 +648,25 @@ impl Engine {
             .quotes
             .insert(instrument_id, pair);
 
-        let book = self.build_book(instrument_id);
-        self.record_market_data(book, &all_trades);
+        self.record_market_data(instrument_id, &all_trades);
+        self.publish_market_data();
         self.send_trade_reports(&mut all_trades);
         Ok(())
     }
 
     // --- book & statistics access (REST / console) ---
 
+    /// Share access to published market data without sharing the Engine lock.
+    pub fn market_data(&self) -> MarketDataReader {
+        self.market_data.reader()
+    }
+
     pub fn book(&self, symbol: &str) -> Option<Book> {
         let instrument = self.instruments.get_by_symbol(symbol)?;
-        self.book_cache.get(&instrument.id).cloned()
+        self.market_data
+            .snapshot(instrument.id)
+            .filter(|snapshot| snapshot.version != 0)
+            .map(|snapshot| snapshot.book.clone())
     }
 
     pub fn statistics(&self, symbol: &str) -> Option<Statistics> {
@@ -695,18 +739,23 @@ impl Engine {
     }
 
     fn build_book(&mut self, instrument_id: i64) -> Book {
+        #[cfg(test)]
+        {
+            self.snapshot_builds += 1;
+        }
         self.books
             .entry(instrument_id)
             .or_insert_with(|| OrderBook::new(instrument_id))
             .build_book()
     }
 
-    /// cache the latest book (assigning a new sequence number) and fold trades
-    /// into the running statistics. Mirrors recordMarketData in stats.go.
-    fn record_market_data(&mut self, mut book: Book, trades: &[RawTrade]) {
+    /// Keep every logical sequence advance and trade, but defer constructing
+    /// full depth until the containing operation finishes. Intermediate
+    /// versions of the same instrument can then be coalesced safely.
+    fn record_market_data(&mut self, instrument_id: i64, trades: &[RawTrade]) {
         self.sequence += 1;
-        book.sequence = self.sequence;
-        let instrument_id = book.instrument_id;
+        self.pending_market_data
+            .insert(instrument_id, self.sequence);
 
         let stats = self
             .stats_cache
@@ -720,20 +769,6 @@ impl Engine {
                 ..Statistics::default()
             });
 
-        if book.has_bids() {
-            stats.bid_price = book.bids[0].price;
-            stats.bid_qty = book.bids[0].quantity;
-        } else {
-            stats.bid_price = Decimal::ZERO;
-            stats.bid_qty = Decimal::ZERO;
-        }
-        if book.has_asks() {
-            stats.ask_price = book.asks[0].price;
-            stats.ask_qty = book.asks[0].quantity;
-        } else {
-            stats.ask_price = Decimal::ZERO;
-            stats.ask_qty = Decimal::ZERO;
-        }
         for trade in trades {
             stats.volume += trade.quantity;
             if !stats.has_high_low {
@@ -749,13 +784,36 @@ impl Engine {
                 }
             }
         }
-        self.book_cache.insert(instrument_id, book);
     }
 
-    /// convenience wrapper used where only the book changed
-    fn record_book(&mut self, instrument_id: i64) {
-        let book = self.build_book(instrument_id);
-        self.record_market_data(book, &[]);
+    /// Synchronously publish the last version of each changed instrument.
+    /// Readers see a complete old or new snapshot; they do not see an
+    /// intermediate removal during replace/disconnect/expiry. No background
+    /// consumer or later market event is needed to flush the final state.
+    fn publish_market_data(&mut self) {
+        let mut pending = std::mem::take(&mut self.pending_market_data);
+        for (instrument_id, sequence) in pending.drain() {
+            let mut book = self.build_book(instrument_id);
+            book.sequence = sequence;
+            let stats = self.stats_cache.get_mut(&instrument_id).unwrap();
+            let (bid_price, bid_qty) = book
+                .bids
+                .first()
+                .map(|level| (level.price, level.quantity))
+                .unwrap_or((Decimal::ZERO, Decimal::ZERO));
+            let (ask_price, ask_qty) = book
+                .asks
+                .first()
+                .map(|level| (level.price, level.quantity))
+                .unwrap_or((Decimal::ZERO, Decimal::ZERO));
+            stats.bid_price = bid_price;
+            stats.bid_qty = bid_qty;
+            stats.ask_price = ask_price;
+            stats.ask_qty = ask_qty;
+            self.market_data.publish(book, stats.clone());
+        }
+        // Reuse the small dirty map's capacity across commands.
+        self.pending_market_data = pending;
     }
 
     /// assign the batch trade id and push fill reports to both sides of every
@@ -849,8 +907,10 @@ impl Engine {
             Report::Fill { order, .. } => &order.session_id,
         };
         if let Some(session) = self.sessions.get(session_id) {
-            // a send error means the connection thread is gone; ignore
-            let _ = session.sender.send(report);
+            // A full/disconnected destination marks its connection failed.
+            // A committed fill is not rolled back; continue delivering to the
+            // other parties rather than waiting for a slow destination.
+            let _ = session.sender.try_send(report);
         }
     }
 }

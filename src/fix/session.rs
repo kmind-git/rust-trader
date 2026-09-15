@@ -5,15 +5,15 @@
 
 use crate::queue::{self as mpsc, Sender};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use rust_decimal::Decimal;
 
-use crate::core::exchange::{Engine, NewOrder, Report};
+use crate::core::exchange::{Engine, NewOrder, Report, ReportSink};
 use crate::core::instrument::Instrument;
 use crate::core::order::{OrderId, OrderState, OrderType, Side};
 
@@ -68,7 +68,30 @@ pub enum OutMsg {
         begin_seq: u64,
         end_seq: u64,
     },
+    /// Acceptor's final Logout reply/error: send it after already queued
+    /// reports, then close without generating any later heartbeat/message.
+    LogoutAndShutdown {
+        fields: Vec<(u32, String)>,
+    },
     Shutdown,
+}
+
+/// Move engine reports directly into the same bounded mailbox as session
+/// messages. There is no intermediate queue or reader-thread report pump.
+struct FixReportSink(Sender<OutMsg>);
+
+impl ReportSink for FixReportSink {
+    fn try_send(&self, report: Report) -> Result<(), TrySendError<Report>> {
+        self.0
+            .send(OutMsg::Report(report))
+            .map_err(|error| match error {
+                TrySendError::Full(OutMsg::Report(report)) => TrySendError::Full(report),
+                TrySendError::Disconnected(OutMsg::Report(report)) => {
+                    TrySendError::Disconnected(report)
+                }
+                _ => unreachable!("the rejected value is the report just submitted"),
+            })
+    }
 }
 
 struct WriterState {
@@ -198,8 +221,19 @@ fn writer_loop(
             },
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        let (out, close_after_write) = match out {
+            OutMsg::LogoutAndShutdown { fields } => (
+                OutMsg::Message {
+                    msg_type: "5",
+                    fields,
+                },
+                true,
+            ),
+            other => (other, false),
+        };
         let bytes = match out {
             OutMsg::Shutdown => break,
+            OutMsg::LogoutAndShutdown { .. } => unreachable!("normalized above"),
             OutMsg::GapFill { begin_seq, end_seq } => {
                 let begin_seq = begin_seq.max(1);
                 let effective_end = if end_seq == 0 {
@@ -273,6 +307,9 @@ fn writer_loop(
         };
         state.log.outgoing(&String::from_utf8_lossy(&bytes));
         if state.stream.write_all(&bytes).is_err() || state.stream.flush().is_err() {
+            break;
+        }
+        if close_after_write {
             break;
         }
     }
@@ -794,7 +831,7 @@ fn handle_acceptor_connection(
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(LOGON_READ_TIMEOUT))?;
     stream.set_write_timeout(Some(LOGON_READ_TIMEOUT))?;
-    let mut reader = frame::FrameReader::new(stream.try_clone()?);
+    let mut reader = frame::FrameReader::new(BufReader::new(stream.try_clone()?));
     let logon = match reader.read_message()? {
         Some(m) => m,
         None => return Ok(()),
@@ -859,14 +896,15 @@ fn handle_acceptor_connection(
     };
     session_log.incoming(&logon.raw);
     session_log.event("Received logon request");
-    stream.set_read_timeout(Some(SOCKET_POLL))?;
+    // Set the timeout on the actual reading handle. Updating a previously
+    // cloned control handle does not update SO_RCVTIMEO on all platforms.
+    // Retain this BufReader across Logon so any prefetched next frame survives.
+    reader
+        .get_ref()
+        .get_ref()
+        .set_read_timeout(Some(SOCKET_POLL))?;
     let ids = Arc::new(Mutex::new(WireIdMap::new()));
     let (tx, rx) = mpsc::channel();
-    let (report_tx, report_rx) = mpsc::channel_with_flag(mpsc::CAPACITY, tx.failure_flag());
-    engine
-        .lock()
-        .unwrap()
-        .register_session(&session_id, report_tx);
     let writer_state = WriterState {
         stream: stream.try_clone()?,
         begin_string: cfg.begin_string.clone(),
@@ -912,9 +950,16 @@ fn handle_acceptor_connection(
             fields: vec![(7, "1".into()), (16, "0".into())],
         });
     }
+    // Establish the Logon/bootstrap output order before exposing this session
+    // as a report destination. All later application events use this mailbox.
+    engine
+        .lock()
+        .unwrap()
+        .register_session_sink(&session_id, FixReportSink(tx.clone()));
     let (probe_after, close_after) = peer_timeouts(heart);
     let mut last_received = std::time::Instant::now();
     let mut pending_test: Option<(String, std::time::Instant)> = None;
+    let mut logout_fields = None;
     loop {
         if tx.failed() {
             session_log.event("Outbound queue overflow/disconnected; closing session");
@@ -922,14 +967,11 @@ fn handle_acceptor_connection(
             break;
         }
         engine.lock().unwrap().expire_day_orders();
-        for report in report_rx.try_iter() {
-            let _ = tx.send(OutMsg::Report(report));
-        }
         if pending_test
             .as_ref()
             .is_some_and(|(_, deadline)| std::time::Instant::now() >= *deadline)
         {
-            send_session_logout(&tx, "TestRequest was not answered");
+            logout_fields = Some(vec![(58, "TestRequest was not answered".into())]);
             break;
         }
         let queued = sequence.take_ready();
@@ -968,7 +1010,7 @@ fn handle_acceptor_connection(
             last_received = std::time::Instant::now();
         }
         if let Err(e) = validate_header(&msg, &cfg.begin_string, &client, &cfg.sender_comp_id) {
-            send_session_logout(&tx, &e);
+            logout_fields = Some(vec![(58, e)]);
             break;
         }
         let msg = match sequence.classify(msg) {
@@ -984,7 +1026,7 @@ fn handle_acceptor_connection(
                 continue;
             }
             Err(e) => {
-                send_session_logout(&tx, &e);
+                logout_fields = Some(vec![(58, e)]);
                 break;
             }
         };
@@ -998,7 +1040,7 @@ fn handle_acceptor_connection(
             continue;
         }
         if let Err(e) = sequence.advance(&msg) {
-            send_session_logout(&tx, &e);
+            logout_fields = Some(vec![(58, e)]);
             break;
         }
         if msg.msg_type() == Some("0")
@@ -1021,10 +1063,7 @@ fn handle_acceptor_connection(
                 let _ = tx.send(OutMsg::GapFill { begin_seq, end_seq });
             }
             Inbound::Logout => {
-                let _ = tx.send(OutMsg::Message {
-                    msg_type: "5",
-                    fields: vec![],
-                });
+                logout_fields = Some(vec![]);
                 break;
             }
             Inbound::Logon { .. } if logon_seq > 1 && msg.seq() == Some(logon_seq) => {}
@@ -1066,11 +1105,17 @@ fn handle_acceptor_connection(
             ),
         }
     }
-    engine.lock().unwrap().session_disconnect(&session_id);
-    for report in report_rx.try_iter() {
-        let _ = tx.send(OutMsg::Report(report));
+    {
+        let mut engine = engine.lock().unwrap();
+        engine.session_disconnect(&session_id);
+        // The same serialization boundary orders earlier committed reports
+        // before Logout and prevents new reports targeting a closing session.
+        if let Some(fields) = logout_fields {
+            let _ = tx.send(OutMsg::LogoutAndShutdown { fields });
+        } else {
+            let _ = tx.send(OutMsg::Shutdown);
+        }
     }
-    let _ = tx.send(OutMsg::Shutdown);
     let _ = writer.join();
     session_log.event("Disconnected");
     Ok(())
@@ -1361,7 +1406,11 @@ impl Initiator {
         stream
             .set_write_timeout(Some(LOGON_READ_TIMEOUT))
             .map_err(ConnectError::Io)?;
-        let reader = frame::FrameReader::new(stream.try_clone().map_err(ConnectError::Io)?);
+        let read_stream = stream.try_clone().map_err(ConnectError::Io)?;
+        read_stream
+            .set_read_timeout(Some(SOCKET_POLL))
+            .map_err(ConnectError::Io)?;
+        let reader = frame::FrameReader::new(BufReader::new(read_stream));
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(InitiatorShared {
             logged_in: Signal::new(),
@@ -1603,7 +1652,7 @@ impl Drop for Initiator {
 }
 
 fn initiator_reader(
-    mut reader: frame::FrameReader<TcpStream>,
+    mut reader: frame::FrameReader<BufReader<TcpStream>>,
     shared: Arc<InitiatorShared>,
     tx: Sender<OutMsg>,
     cfg: InitiatorConfig,
@@ -1900,6 +1949,79 @@ mod tests {
         };
         writer_loop(state, rx, Duration::from_secs(30), tx.failure_flag());
         assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0);
+    }
+
+    #[test]
+    fn direct_report_destination_overflow_does_not_block_the_other_party() {
+        let mut engine = Engine::new();
+        let instrument_id = engine.create_instrument("IBM");
+        let (slow_tx, _slow_rx) =
+            mpsc::channel_with_flag(1, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let (fast_tx, fast_rx) = mpsc::channel();
+        engine.register_session_sink("slow", FixReportSink(slow_tx.clone()));
+        engine.register_session_sink("fast", FixReportSink(fast_tx.clone()));
+        for (session, side) in [("slow", Side::Sell), ("fast", Side::Buy)] {
+            engine
+                .create_order(
+                    session,
+                    NewOrder {
+                        id: 1,
+                        instrument_id,
+                        side,
+                        order_type: OrderType::Limit,
+                        price: Decimal::from(100),
+                        quantity: Decimal::from(5),
+                    },
+                )
+                .unwrap();
+        }
+        // Slow's New report filled its only slot; its Fill cannot be queued.
+        // Fast still receives its Fill directly, without any report pump.
+        assert!(slow_tx.failed());
+        assert!(!fast_tx.failed());
+        assert!(
+            matches!(fast_rx.try_recv().unwrap(), OutMsg::Report(Report::Fill {
+            order, last_quantity, ..
+        }) if order.state == OrderState::Filled && last_quantity == Decimal::from(5))
+        );
+        assert!(engine.book("IBM").unwrap().bids.is_empty());
+        assert!(engine.book("IBM").unwrap().asks.is_empty());
+        assert_eq!(engine.statistics("IBM").unwrap().volume, Decimal::from(5));
+    }
+
+    #[test]
+    fn final_logout_is_the_last_frame_even_if_more_output_was_queued() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(OutMsg::LogoutAndShutdown { fields: vec![] })
+            .unwrap();
+        tx.send(OutMsg::Message {
+            msg_type: "0",
+            fields: vec![],
+        })
+        .unwrap();
+        writer_loop(
+            WriterState {
+                stream,
+                begin_string: "FIX.4.2".into(),
+                sender_comp_id: "S".into(),
+                target_comp_id: "T".into(),
+                seq: 0,
+                log: SessionLog::disabled(),
+                wire_ids: None,
+            },
+            rx,
+            Duration::from_secs(30),
+            tx.failure_flag(),
+        );
+        let mut reader = frame::FrameReader::new(BufReader::new(peer));
+        let logout = reader.read_message().unwrap().unwrap();
+        assert_eq!(logout.msg_type(), Some("5"));
+        assert_eq!(logout.seq(), Some(1));
+        assert!(reader.read_message().unwrap().is_none());
     }
 
     #[test]

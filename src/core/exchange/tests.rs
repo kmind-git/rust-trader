@@ -575,3 +575,157 @@ fn day_orders_expire_once_and_leave_the_book() {
         1
     );
 }
+
+#[test]
+fn replacement_coalesces_depth_and_publishes_zero_remaining_without_later_work() {
+    let mut engine = Engine::new();
+    let instrument_id = engine.create_instrument("IBM");
+    let (tx, _rx) = mpsc::channel();
+    engine.register_session("c", tx);
+    for (id, side, quantity) in [(1, Side::Sell, 4), (2, Side::Buy, 10)] {
+        engine
+            .create_order(
+                "c",
+                NewOrder {
+                    id,
+                    instrument_id,
+                    side,
+                    order_type: OrderType::Limit,
+                    price: Decimal::from(100),
+                    quantity: Decimal::from(quantity),
+                },
+            )
+            .unwrap();
+    }
+    let reader = engine.market_data();
+    let before = reader.snapshot("IBM").unwrap();
+    let builds = engine.snapshot_builds;
+    engine
+        .modify_order("c", 2, 3, Decimal::from(101), Decimal::from(10))
+        .unwrap();
+    let replaced = reader.snapshot("IBM").unwrap();
+    assert_eq!(engine.snapshot_builds - builds, 1);
+    assert_eq!(replaced.version, before.version + 2);
+    assert_eq!(replaced.book.bids[0].price, Decimal::from(101));
+    assert_eq!(replaced.book.bids[0].quantity, Decimal::from(6));
+    assert_eq!(replaced.stats.volume, Decimal::from(4));
+
+    engine
+        .modify_order("c", 3, 4, Decimal::from(101), Decimal::from(4))
+        .unwrap();
+    let final_state = reader.snapshot("IBM").unwrap();
+    assert_eq!(engine.snapshot_builds - builds, 2);
+    assert_eq!(final_state.version, replaced.version + 1);
+    assert!(final_state.book.bids.is_empty());
+    assert!(final_state.book.asks.is_empty());
+    assert_eq!(final_state.stats.bid_price, Decimal::ZERO);
+    assert_eq!(final_state.stats.bid_qty, Decimal::ZERO);
+    assert_eq!(final_state.stats.volume, Decimal::from(4));
+    assert_eq!(final_state.stats.high, Decimal::from(100));
+    assert_eq!(final_state.stats.low, Decimal::from(100));
+    assert!(engine.pending_market_data.is_empty());
+    assert_eq!(before.book.bids[0].price, Decimal::from(100));
+}
+
+#[test]
+fn disconnect_builds_once_per_instrument_and_keeps_logical_versions() {
+    let mut engine = Engine::new();
+    let a = engine.create_instrument("A");
+    let b = engine.create_instrument("B");
+    let (tx, _rx) = mpsc::channel();
+    engine.register_session("c", tx);
+    for id in 1..=8 {
+        engine
+            .create_order(
+                "c",
+                NewOrder {
+                    id,
+                    instrument_id: if id % 2 == 0 { a } else { b },
+                    side: Side::Buy,
+                    order_type: OrderType::Limit,
+                    price: Decimal::from(id),
+                    quantity: Decimal::ONE,
+                },
+            )
+            .unwrap();
+    }
+    // The existing sequence contract also counts a disconnected session's
+    // terminal order records. Coalescing must not silently renumber them.
+    engine.cancel_order("c", 1).unwrap();
+    let reader = engine.market_data();
+    let version = engine.sequence;
+    let builds = engine.snapshot_builds;
+    engine.session_disconnect("c");
+    assert_eq!(engine.snapshot_builds - builds, 2);
+    assert_eq!(engine.sequence, version + 8);
+    let mut last_version = 0;
+    for symbol in ["A", "B"] {
+        let snapshot = reader.snapshot(symbol).unwrap();
+        assert!(snapshot.book.bids.is_empty());
+        assert!(snapshot.book.asks.is_empty());
+        assert_eq!(snapshot.stats.bid_price, Decimal::ZERO);
+        assert_eq!(snapshot.stats.bid_qty, Decimal::ZERO);
+        assert!(snapshot.version > version);
+        assert_eq!(snapshot.book.sequence, snapshot.version);
+        last_version = last_version.max(snapshot.version);
+    }
+    assert_eq!(last_version, engine.sequence);
+    assert!(engine.pending_market_data.is_empty());
+}
+
+#[test]
+fn expiry_coalesces_per_instrument_without_losing_expiration_reports() {
+    let mut engine = Engine::new();
+    let a = engine.create_instrument("A");
+    let b = engine.create_instrument("B");
+    let (tx, rx) = mpsc::channel();
+    engine.register_session("c", tx);
+    for id in 1..=8 {
+        engine
+            .create_order(
+                "c",
+                NewOrder {
+                    id,
+                    instrument_id: if id % 2 == 0 { a } else { b },
+                    side: Side::Buy,
+                    order_type: OrderType::Limit,
+                    price: Decimal::ONE,
+                    quantity: Decimal::ONE,
+                },
+            )
+            .unwrap();
+    }
+    let reader = engine.market_data();
+    let builds = engine.snapshot_builds;
+    let version = engine.sequence;
+    let tomorrow = engine
+        .order_dates
+        .values()
+        .max()
+        .unwrap()
+        .succ_opt()
+        .unwrap();
+    engine.expire_day_orders_at(tomorrow);
+    assert_eq!(engine.snapshot_builds - builds, 2);
+    assert_eq!(engine.sequence, version + 8);
+    for symbol in ["A", "B"] {
+        let snapshot = reader.snapshot(symbol).unwrap();
+        assert!(snapshot.book.bids.is_empty());
+        assert_eq!(snapshot.stats.bid_qty, Decimal::ZERO);
+    }
+    assert_eq!(
+        rx.try_iter()
+            .filter(|report| matches!(
+                report,
+                Report::Status {
+                    exec_type: ExecType::Expired,
+                    ..
+                }
+            ))
+            .count(),
+        8
+    );
+    engine.expire_day_orders_at(tomorrow);
+    assert_eq!(engine.snapshot_builds - builds, 2);
+    assert!(engine.pending_market_data.is_empty());
+}

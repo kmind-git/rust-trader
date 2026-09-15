@@ -59,22 +59,27 @@ impl<R: std::io::Read> FrameReader<R> {
         &self.pending
     }
 
+    /// Borrow the underlying reader without consuming any buffered frame data.
+    pub(crate) fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
     pub fn read_message(&mut self) -> std::io::Result<Option<FixMessage>> {
         loop {
             if self.total.is_none() {
-                let ends: Vec<usize> = self
-                    .pending
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, b)| (*b == SOH).then_some(i))
-                    .take(2)
-                    .collect();
-                if ends.len() == 2 {
-                    let begin = &self.pending[..ends[0]];
+                let first_end = self.pending.iter().position(|b| *b == SOH);
+                let second_end = first_end.and_then(|first| {
+                    self.pending[first + 1..]
+                        .iter()
+                        .position(|b| *b == SOH)
+                        .map(|relative| first + 1 + relative)
+                });
+                if let (Some(first_end), Some(second_end)) = (first_end, second_end) {
+                    let begin = &self.pending[..first_end];
                     if !begin.starts_with(b"8=") || begin.len() <= 2 {
                         return Err(invalid("expected 8=BeginString"));
                     }
-                    let length = &self.pending[ends[0] + 1..ends[1]];
+                    let length = &self.pending[first_end + 1..second_end];
                     if !length.starts_with(b"9=")
                         || length.len() <= 2
                         || !length[2..].iter().all(u8::is_ascii_digit)
@@ -85,7 +90,7 @@ impl<R: std::io::Read> FrameReader<R> {
                         .unwrap()
                         .parse::<usize>()
                         .map_err(|_| invalid("bad BodyLength"))?;
-                    let total = (ends[1] + 1)
+                    let total = (second_end + 1)
                         .checked_add(body_len)
                         .and_then(|n| n.checked_add(7))
                         .filter(|n| *n <= MAX_MESSAGE_SIZE)
@@ -259,10 +264,28 @@ mod tests {
                 ErrorKind::InvalidData
             );
         }
+
+        let mut oversized_body = b"8=FIX.4.2\x019=1048576\x01".to_vec();
+        oversized_body.extend_from_slice(b"35=0\x01");
+        assert_eq!(
+            read_message(&mut std::io::Cursor::new(oversized_body))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        let mut oversized_header = b"8=FIX.4.2\x019=".to_vec();
+        oversized_header.extend(std::iter::repeat(b'1').take(MAX_PREFIX_SIZE));
+        assert_eq!(
+            read_message(&mut std::io::Cursor::new(oversized_header))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
     }
 
     #[test]
-    fn decoder_retains_partial_message_across_timeouts() {
+    fn decoder_retains_partial_message_across_timeouts_with_buffered_reader() {
         struct InterruptedStream {
             data: std::io::Cursor<Vec<u8>>,
             timed_out: bool,
@@ -278,10 +301,11 @@ mod tests {
             }
         }
         let bytes = frame("FIX.4.2", "0", 1, "A", "B", &[]);
-        let mut reader = FrameReader::new(InterruptedStream {
+        let source = InterruptedStream {
             data: std::io::Cursor::new(bytes.clone()),
             timed_out: false,
-        });
+        };
+        let mut reader = FrameReader::new(std::io::BufReader::with_capacity(8, source));
         assert_eq!(
             reader.read_message().unwrap_err().kind(),
             ErrorKind::TimedOut
@@ -375,5 +399,53 @@ mod tests {
         let second = read_message(&mut reader).unwrap().unwrap();
         assert_eq!(second.seq(), Some(2));
         assert!(read_message(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn persistent_bufreader_keeps_merged_followup_frame() {
+        let m1 = frame("FIX.4.2", "0", 1, "A", "B", &[]);
+        let m2 = frame("FIX.4.2", "0", 2, "A", "B", &[]);
+        let mut data = m1;
+        data.extend_from_slice(&m2);
+        let source = std::io::BufReader::new(std::io::Cursor::new(data));
+        let mut reader = FrameReader::new(source);
+
+        assert_eq!(reader.read_message().unwrap().unwrap().seq(), Some(1));
+        assert_eq!(reader.read_message().unwrap().unwrap().seq(), Some(2));
+        assert!(reader.read_message().unwrap().is_none());
+    }
+
+    #[test]
+    fn buffered_reader_coalesces_small_frame_reads_at_underlying_reader() {
+        struct CountingRead {
+            inner: std::io::Cursor<Vec<u8>>,
+            reads: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl std::io::Read for CountingRead {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.set(self.reads.get() + 1);
+                std::io::Read::read(&mut self.inner, out)
+            }
+        }
+
+        let mut data = frame("FIX.4.2", "0", 1, "A", "B", &[]);
+        data.extend_from_slice(&frame("FIX.4.2", "0", 2, "A", "B", &[]));
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let source = CountingRead {
+            inner: std::io::Cursor::new(data),
+            reads: reads.clone(),
+        };
+        let buffered = std::io::BufReader::with_capacity(4096, source);
+        let mut reader = FrameReader::new(buffered);
+
+        assert_eq!(reader.read_message().unwrap().unwrap().seq(), Some(1));
+        assert_eq!(reader.read_message().unwrap().unwrap().seq(), Some(2));
+        // This counts calls into CountingRead, not operating-system syscalls.
+        assert!(
+            reads.get() <= 2,
+            "merged frames required too many underlying Read calls: {}",
+            reads.get()
+        );
     }
 }

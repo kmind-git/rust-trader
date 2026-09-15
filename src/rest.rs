@@ -4,6 +4,7 @@ use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
 
 use crate::core::exchange::Engine;
+use crate::market_data::{InstrumentSnapshot, MarketDataReader};
 
 /// read-only REST api mirroring the Go implementation's endpoints and JSON
 /// field names exactly (internal/exchange/webserver.go).
@@ -42,78 +43,85 @@ fn to_f64(d: rust_decimal::Decimal) -> f64 {
 
 enum Snapshot {
     Strings(Vec<String>),
-    Book(String, Option<crate::core::orderbook::Book>),
-    Stats(String, Option<crate::core::stats::Statistics>),
+    Book(String, Arc<InstrumentSnapshot>),
+    Stats(String, Arc<InstrumentSnapshot>),
     Missing(String),
 }
 
-fn snapshot(engine: &Engine, path: &str) -> Snapshot {
+/// Resolve a market-data request through the immutable read handle.
+///
+/// `MarketDataReader::snapshot` returns `None` only for an unknown symbol. A
+/// known instrument with no orders still has an empty, sequence-zero
+/// snapshot, so this preserves the old REST distinction between an empty book
+/// and a 404 response without touching the engine mutex.
+fn market_snapshot(reader: &MarketDataReader, path: &str) -> Snapshot {
     if path.starts_with("/api/instruments/") || path == "/api/instruments" {
-        return Snapshot::Strings(engine.all_symbols());
-    }
-    if path == "/api/sessions" {
-        return Snapshot::Strings(engine.session_ids());
+        return Snapshot::Strings(reader.all_symbols());
     }
     for (prefix, book) in [("/api/book/", true), ("/api/stats/", false)] {
         if let Some(symbol) = path.strip_prefix(prefix) {
             if symbol.is_empty() {
                 break;
             }
-            if engine.instrument_by_symbol(symbol).is_none() {
+            let Some(market) = reader.snapshot(symbol) else {
                 return Snapshot::Missing(format!("the symbol {} is unknown\n", symbol));
-            }
+            };
             return if book {
-                Snapshot::Book(symbol.into(), engine.book(symbol))
+                Snapshot::Book(symbol.into(), market)
             } else {
-                Snapshot::Stats(symbol.into(), engine.statistics(symbol))
+                Snapshot::Stats(symbol.into(), market)
             };
         }
     }
     Snapshot::Missing("404 page not found".into())
 }
 
+/// Route one request as the REST workers do.
+///
+/// The engine mutex is supplied because this is the actual worker routing
+/// function. It is acquired only for `/api/sessions`; market endpoints use the
+/// read handle and therefore do not dereference or lock the engine.
+fn request_snapshot(reader: &MarketDataReader, engine: &Mutex<Engine>, path: &str) -> Snapshot {
+    if path == "/api/sessions" {
+        let engine = engine.lock().unwrap();
+        return Snapshot::Strings(engine.session_ids());
+    }
+    market_snapshot(reader, path)
+}
+
 fn serialize(snapshot: Snapshot) -> (u16, String) {
     let body = match snapshot {
         Snapshot::Missing(message) => return (404, message),
         Snapshot::Strings(values) => serde_json::to_string(&values).unwrap(),
-        Snapshot::Book(symbol, book) => {
-            let levels = |items: Vec<crate::core::orderbook::BookLevel>| {
+        Snapshot::Book(symbol, market) => {
+            let levels = |items: &[crate::core::orderbook::BookLevel]| {
                 items
-                    .into_iter()
+                    .iter()
                     .map(|l| LevelDto {
                         price: to_f64(l.price),
                         quantity: to_f64(l.quantity),
                     })
                     .collect()
             };
-            let dto = match book {
-                Some(book) => BookDto {
-                    symbol,
-                    sequence: book.sequence,
-                    bids: levels(book.bids),
-                    asks: levels(book.asks),
-                },
-                None => BookDto {
-                    symbol,
-                    sequence: 0,
-                    bids: vec![],
-                    asks: vec![],
-                },
+            let dto = BookDto {
+                symbol,
+                sequence: market.book.sequence,
+                bids: levels(&market.book.bids),
+                asks: levels(&market.book.asks),
             };
             serde_json::to_string(&dto).unwrap()
         }
-        Snapshot::Stats(symbol, stats) => {
-            let stats = stats.unwrap_or_default();
+        Snapshot::Stats(symbol, market) => {
             let dto = StatsDto {
                 symbol,
-                bid_price: to_f64(stats.bid_price),
-                bid_qty: to_f64(stats.bid_qty),
-                ask_price: to_f64(stats.ask_price),
-                ask_qty: to_f64(stats.ask_qty),
-                volume: to_f64(stats.volume),
-                high: to_f64(stats.high),
-                low: to_f64(stats.low),
-                has_high_low: stats.has_high_low,
+                bid_price: to_f64(market.stats.bid_price),
+                bid_qty: to_f64(market.stats.bid_qty),
+                ask_price: to_f64(market.stats.ask_price),
+                ask_qty: to_f64(market.stats.ask_qty),
+                volume: to_f64(market.stats.volume),
+                high: to_f64(market.stats.high),
+                low: to_f64(market.stats.low),
+                has_high_low: market.stats.has_high_low,
             };
             serde_json::to_string(&dto).unwrap()
         }
@@ -123,7 +131,13 @@ fn serialize(snapshot: Snapshot) -> (u16, String) {
 
 /// Compatibility helper for callers without a shared mutex.
 pub fn respond(engine: &Engine, path: &str) -> (u16, String) {
-    serialize(snapshot(engine, path))
+    let reader = engine.market_data();
+    let data = if path == "/api/sessions" {
+        Snapshot::Strings(engine.session_ids())
+    } else {
+        market_snapshot(&reader, path)
+    };
+    serialize(data)
 }
 
 /// start the REST server: one accept loop, N worker threads sharing the server
@@ -132,6 +146,13 @@ pub fn start(
     addr: &str,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     let server = Arc::new(tiny_http::Server::http(addr).map_err(std::io::Error::other)?);
+    // The handle is independent of the engine mutex. It observes newly
+    // created instruments through the shared registry while each worker can
+    // serve market data without locking the matching engine.
+    let market_data = {
+        let engine = engine.lock().unwrap();
+        engine.market_data()
+    };
     let handle = std::thread::Builder::new()
         .name("rest".to_string())
         .spawn(move || {
@@ -139,6 +160,7 @@ pub fn start(
             for i in 0..4 {
                 let server = Arc::clone(&server);
                 let engine = Arc::clone(&engine);
+                let market_data = market_data.clone();
                 let worker = std::thread::Builder::new()
                     .name(format!("rest-worker-{}", i))
                     .spawn(move || loop {
@@ -147,10 +169,7 @@ pub fn start(
                             Err(_) => continue,
                         };
                         let path = request.url().to_string();
-                        let data = {
-                            let engine = engine.lock().unwrap();
-                            snapshot(&engine, &path)
-                        };
+                        let data = request_snapshot(&market_data, &engine, &path);
                         let (status, body) = serialize(data);
                         let content_type = if body.starts_with('{') || body.starts_with('[') {
                             "application/json"
@@ -216,17 +235,99 @@ mod tests {
 
     #[test]
     fn snapshot_survives_engine_change_and_serializes_without_lock() {
-        let shared = Mutex::new(engine_with_market());
-        let data = {
-            let engine = shared.lock().unwrap();
-            snapshot(&engine, "/api/book/IBM")
-        };
-        let mut guard = shared.try_lock().expect("snapshot must not borrow lock");
-        guard.session_disconnect("mm");
-        let (status, body) = serialize(data);
+        let mut engine = engine_with_market();
+        let reader = engine.market_data();
+        let old = reader.snapshot("IBM").expect("IBM snapshot");
+        assert!(!old.book.asks.is_empty());
+
+        engine.session_disconnect("mm");
+
+        let current = reader.snapshot("IBM").expect("IBM snapshot");
+        assert!(current.book.asks.is_empty());
+        assert!(current.version > old.version);
+        let shared = Mutex::new(engine);
+        let (status, body) = serialize(request_snapshot(&reader, &shared, "/api/book/IBM"));
         assert_eq!(status, 200);
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(!json["asks"].as_array().unwrap().is_empty());
+        assert!(json["asks"].as_array().unwrap().is_empty());
+        let (_, old_body) = serialize(Snapshot::Book("IBM".into(), old));
+        let old_json: serde_json::Value = serde_json::from_str(&old_body).unwrap();
+        assert!(!old_json["asks"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn market_route_completes_while_engine_mutex_is_held() {
+        let shared = Arc::new(Mutex::new(engine_with_market()));
+        let reader = {
+            let engine = shared.lock().unwrap();
+            engine.market_data()
+        };
+        let engine_guard = shared.lock().unwrap();
+
+        // This is the same route function used by workers. The route itself
+        // decides whether the Engine mutex is needed; market paths do not
+        // acquire it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let querying = shared.clone();
+        let worker = std::thread::spawn(move || {
+            let responses: Vec<_> = [
+                "/api/book/IBM",
+                "/api/stats/IBM",
+                "/api/instruments",
+                "/bad",
+            ]
+            .into_iter()
+            .map(|path| serialize(request_snapshot(&reader, &querying, path)))
+            .collect();
+            let _ = tx.send(responses);
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Release before joining so a locking regression fails instead of
+        // leaving the test process deadlocked forever.
+        drop(engine_guard);
+        worker.join().unwrap();
+        let responses = result.expect("market routes must not wait for the Engine mutex");
+        assert_eq!(
+            responses.iter().map(|r| r.0).collect::<Vec<_>>(),
+            [200, 200, 200, 404]
+        );
+        assert!(responses[0].1.contains("\"symbol\":\"IBM\""));
+    }
+
+    #[test]
+    fn old_reader_discovers_new_instruments() {
+        let mut engine = Engine::new();
+        let reader = engine.market_data();
+        assert!(reader.all_symbols().is_empty());
+
+        engine.create_instrument("IBM");
+
+        assert_eq!(reader.all_symbols(), vec!["IBM".to_string()]);
+    }
+
+    #[test]
+    fn known_empty_and_unknown_symbols_keep_rest_semantics() {
+        let mut engine = Engine::new();
+        engine.create_instrument("EMPTY");
+        let reader = engine.market_data();
+
+        let empty = reader.snapshot("EMPTY").expect("known empty instrument");
+        assert_eq!(empty.version, 0);
+        assert_eq!(empty.book.sequence, 0);
+        assert!(empty.book.bids.is_empty());
+        assert!(empty.book.asks.is_empty());
+
+        let shared = Mutex::new(engine);
+        let (status, body) = serialize(request_snapshot(&reader, &shared, "/api/book/EMPTY"));
+        assert_eq!(status, 200);
+        assert_eq!(
+            body,
+            r#"{"symbol":"EMPTY","sequence":0,"bids":[],"asks":[]}"#
+        );
+
+        let (status, body) = serialize(request_snapshot(&reader, &shared, "/api/book/UNKNOWN"));
+        assert_eq!(status, 404);
+        assert_eq!(body, "the symbol UNKNOWN is unknown\n");
     }
 
     #[test]
