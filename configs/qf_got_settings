@@ -23,3 +23,11 @@ SocketAcceptPort=5001
 SenderCompID=GOX
 TargetCompID=PLAYBACK
 SocketAcceptPort=5001
+
+# Declared client session 3.
+[SESSION]
+SenderCompID=GOX
+TargetCompID=ORDERHUB
+SocketAcceptPort=5001
+
+
