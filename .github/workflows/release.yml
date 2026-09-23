@@ -40,7 +40,7 @@ jobs:
           echo "id=$RID" >> "$GITHUB_OUTPUT"
 
       - name: Package candidate (ELF gate + SHA256 + BUILD-INFO)
-        run: scripts/package-linux.sh "${{ steps.rel.outputs.id }}" target dist
+        run: bash scripts/package-linux.sh "${{ steps.rel.outputs.id }}" target dist
         env:
           CI_RUNNER: ubuntu-24.04 (github-actions)
 
