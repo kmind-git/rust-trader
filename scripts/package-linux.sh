@@ -55,8 +55,10 @@ for bin in "$ROOT"/bin/*; do
 done
 
 # --- line-ending / permission sanity for text payload ---
-# git checkout on the runner is LF; enforce expectations explicitly
-grep -rl $'\r' "$ROOT" --exclude='bin/*' >/dev/null 2>&1 && { echo "FATAL: CRLF found in text payload" >&2; exit 1; } || true
+# check only the known text files: binaries legitimately contain 0x0D bytes
+if grep -rlq $'\r' "$ROOT"/configs "$ROOT"/examples "$ROOT"/systemd "$ROOT"/LICENSE "$ROOT"/DEPLOY.md 2>/dev/null; then
+    echo "FATAL: CRLF found in text payload" >&2; exit 1
+fi
 chmod 644 "$ROOT"/configs/* "$ROOT"/examples/* "$ROOT"/systemd/* "$ROOT"/LICENSE "$ROOT"/DEPLOY.md
 
 # --- build metadata ---
