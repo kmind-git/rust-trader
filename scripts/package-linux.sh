@@ -43,7 +43,8 @@ for bin in "$ROOT"/bin/*; do
     echo "--- $name: $(file -b "$bin")"
     readelf -d "$bin" 2>/dev/null | grep -E 'NEEDED|INTERP' || echo "    (no NEEDED/INTERP entries)"
     file "$bin" | grep -q "ELF 64-bit LSB.*x86-64" || { echo "FATAL: $name is not an x86-64 ELF" >&2; exit 1; }
-    file "$bin" | grep -q "statically linked"     || { echo "FATAL: $name is not statically linked" >&2; exit 1; }
+    # newer file(1) classifies rustc musl output as "static-pie linked"
+    file "$bin" | grep -qE "statically linked|static-pie linked" || { echo "FATAL: $name is not statically linked" >&2; exit 1; }
     if readelf -l "$bin" | grep -q PT_INTERP; then
         echo "FATAL: $name has PT_INTERP (dynamic interpreter)" >&2; exit 1
     fi
