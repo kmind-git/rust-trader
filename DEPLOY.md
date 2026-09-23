@@ -62,3 +62,16 @@ systemctl restart rust-trader
 ```
 
 注意：交易所状态为**内存态，无持久化**——重启即清零（品种、订单、统计）。
+
+## 内网（离线）构建
+
+目标机无外网时，用离线源码包 `rust-trader-offline-src.tar.gz`（在有网机器上 `cargo vendor` 生成，内含全部 105 个依赖源码与 `.cargo/config.toml`，已验证可纯离线编译）：
+
+```bash
+tar xzf rust-trader-offline-src.tar.gz
+cd rust-trader
+cargo build --release --offline          # 不访问 crates.io
+./target/release/exchange                # 本机(gnu)构建，产物直接可跑
+```
+
+前置：rustc ≥ 1.74（rustup 安装）、gcc（链接器）。**离线机器建议直接本机 gnu 构建**——目标机就是部署机时 glibc 天然匹配；musl 静态需要 rustup 另行下载 target 组件，内网拿不到，除非从有网机器拷贝 `~/.rustup/toolchains/<版本>/lib/rustlib/x86_64-unknown-linux-musl/` 目录（须版本完全一致）。

@@ -1,5 +1,8 @@
 name: release
 
+# P1 of docs/linux-rhel76-packaging-plan.md: pinned, traceable candidate builds.
+# Artifacts are CANDIDATES until the same SHA-256 passes the RHEL 7.6 gate (§4.7).
+
 on:
   push:
     tags: ['v*']
@@ -10,39 +13,50 @@ permissions:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install musl target
-        run: rustup target add x86_64-unknown-linux-musl
+      - name: Install musl toolchain and binutils
+        run: sudo apt-get update && sudo apt-get install -y musl-tools binutils
 
-      - name: Build (musl static)
-        run: cargo build --release --target x86_64-unknown-linux-musl
+      - name: Show pinned toolchain (rust-toolchain.toml)
+        run: rustc -Vv && cargo -V && sha256sum Cargo.lock
 
-      - name: Package
+      - name: Test (musl target)
+        run: cargo test --locked --target x86_64-unknown-linux-musl
+
+      - name: Build (musl static, all bins)
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl --bins
+
+      - name: Determine release id
+        id: rel
         run: |
-          VER="${GITHUB_REF_NAME#v}"
-          [ "$VER" = "main" ] || [ "$VER" = "$GITHUB_REF_NAME" ] && VER="${GITHUB_REF_NAME#v}"
-          D="rust-trader-${VER}-linux-x86_64"
-          mkdir -p "dist/${D}/systemd"
-          cp target/x86_64-unknown-linux-musl/release/exchange "dist/${D}/"
-          cp -r configs "dist/${D}/configs"
-          cp deploy/rust-trader.service "dist/${D}/systemd/"
-          cp DEPLOY.md "dist/${D}/"
-          tar czf "dist/${D}.tar.gz" -C dist "${D}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            RID="${GITHUB_REF_NAME#v}"
+          else
+            RID="dev-$(git rev-parse --short HEAD)-${GITHUB_RUN_NUMBER}"
+          fi
+          echo "id=$RID" >> "$GITHUB_OUTPUT"
+
+      - name: Package candidate (ELF gate + SHA256 + BUILD-INFO)
+        run: scripts/package-linux.sh "${{ steps.rel.outputs.id }}" target dist
+        env:
+          CI_RUNNER: ubuntu-24.04 (github-actions)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-x86_64-tarball
-          path: dist/*.tar.gz
+          name: linux-x86_64-musl-candidate
+          path: dist/*
           if-no-files-found: error
 
-      - name: Attach to GitHub Release (tag builds only)
+      - name: Attach candidate to GitHub Release (tag builds only)
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz --generate-notes \
-            || gh release upload "${GITHUB_REF_NAME}" dist/*.tar.gz --clobber
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 \
+            --prerelease \
+            --notes "候选包（musl 静态构建）。在 RHEL 7.6 验收通过并复核同一 SHA-256 前，兼容性状态为待验收，见 docs/linux-rhel76-packaging-plan.md §4。" \
+            || gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 --clobber

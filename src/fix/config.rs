@@ -671,7 +671,12 @@ mod tests {
     fn checked_in_quickfix_samples_resolve_their_sessions() {
         let acceptor =
             FixConfig::load(include_str!("../../configs/qf_got_settings").as_bytes()).unwrap();
-        assert_eq!(acceptor.acceptors().len(), 2);
+        // CLIENT, PLAYBACK and ORDERHUB are declared in the checked-in sample
+        assert_eq!(acceptor.acceptors().len(), 3);
+        assert_eq!(
+            acceptor.acceptors()[2].get("TargetCompID"),
+            Some("ORDERHUB")
+        );
         assert_eq!(
             acceptor.acceptors()[0].get("SocketAcceptPort"),
             Some("5001")
