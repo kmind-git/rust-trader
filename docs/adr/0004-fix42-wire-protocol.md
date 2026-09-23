@@ -11,4 +11,3 @@
 - FIX 4.4 的 `150=F(Trade)` / `150=I(Order Status)` 在本项目中不使用；订单状态看 `OrdStatus(39)`，成交和状态回报仍按 FIX 4.2 的 ExecType/OrdStatus 组合表达。
 - FIX 4.2 的完整字典消息集大于本项目实现范围。未实现的 SecurityListRequest(x)、动态品种创建以及其它应用消息会被明确拒绝，不会被当作已支持消息处理。
 - `BusinessMessageReject(j)` 仅用于已定义的业务拒绝场景，并携带可关联原请求的标准引用字段；会话层格式错误使用 FIX 4.2 会话级拒绝流程。
-- 与参照实现 go-trader（FIX 4.4）的交叉验证随版本分叉退役；若需重启对照，需临时将 go-trader 的 BeginString 配置同步为 FIX.4.2（quickfixgo 支持多版本，但其应用层仍会发送 4.4 风格的 I/F 值，仅供参考不再作为 oracle）。

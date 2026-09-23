@@ -19,12 +19,12 @@ rust-trader-<版本>-linux-x86_64/
 
 ```bash
 # 1. 创建运行用户
-useradd -r -s /sbin/nologin gotrader
+useradd -r -s /sbin/nologin rusttrader
 
 # 2. 解压到 /opt/rust-trader
 mkdir -p /opt/rust-trader
 tar xzf rust-trader-*-linux-x86_64.tar.gz -C /opt/rust-trader --strip-components=1
-chown -R gotrader:gotrader /opt/rust-trader
+chown -R rusttrader:rusttrader /opt/rust-trader
 
 # 3. 安装并启动服务
 cp /opt/rust-trader/systemd/rust-trader.service /etc/systemd/system/
@@ -61,4 +61,4 @@ systemctl stop rust-trader      # 停止
 systemctl restart rust-trader
 ```
 
-注意：交易所状态为**内存态，无持久化**——重启即清零（品种、订单、统计），与 go-trader 行为一致。
+注意：交易所状态为**内存态，无持久化**——重启即清零（品种、订单、统计）。

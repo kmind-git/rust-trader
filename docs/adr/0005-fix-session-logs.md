@@ -16,4 +16,4 @@
 - 文件创建或写入失败会写入 `log::warn!`；日志失败不会伪装成成功写入。`Logging=N` 使用禁用句柄，不创建日志目录或文件。
 - Logon 握手被拒（非 Logon 首条/版本不符/未知 target）也会留下 event 记录（"Failed handshake: ..."），为此 acceptor 先取 SenderCompID(49) 再校验；无 49 的连接无文件日志（与此前一致走 env_logger）。
 - 心跳进 messages 日志（对齐 QuickFIX/Go，每 HeartBtInt 一条）；日志文件 append 模式、无轮转，长期运行需自行清理 `logs/`。
-- README 排错段现在指向本项目的 `Logging=Y/N` 与 `FileLogPath`；这些键由 Rust 配置解析器实际消费，和 Go 版日志实现相互独立。
+- README 排错段现在指向本项目的 `Logging=Y/N` 与 `FileLogPath`；这些键由本项目配置解析器实际消费。

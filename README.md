@@ -1,10 +1,9 @@
 # rust-trader
 
-go-trader 的 Rust 重写（自研底座）。价格-时间优先撮合引擎、手写最小 FIX 4.2 会话层、只读 REST 查询、命令行客户端与行情回放。
+模拟电子交易所（自研底座）：价格-时间优先撮合引擎、手写最小 FIX 4.2 会话层、只读 REST 查询、命令行客户端与行情回放。
 
-> 重写方案与决策记录见 [docs/rust-rewrite-plan.md](docs/rust-rewrite-plan.md)、[docs/adr/](docs/adr/)。
+> 决策记录见 [docs/adr/](docs/adr/)。
 > 系统架构图：[docs/rust-trader-architecture.html](docs/rust-trader-architecture.html)（交互式，支持明暗主题 / 视图导览 / 导出；规格见 [docs/architecture.json](docs/architecture.json)）。
-> 参照实现：`../go-trader`（Go 版，开发期作为测试对照 oracle 保留）。
 
 ## 构建
 
@@ -18,7 +17,7 @@ cargo test              # 单元测试（含 FIX 配置、日志和独立的撮�
 ```bash
 # 终端 1：交易所（REST :8080 + FIX acceptor :5001）
 ./target/release/exchange
-# 终端 2：回放模拟市场（复用 go-trader 的 configs/）
+# 终端 2：回放模拟市场
 ./target/release/playback -fix configs/qf_connector_settings -id PLAYBACK -file configs/playback.txt
 # 终端 3：下单 REPL
 ./target/release/client -fix configs/qf_connector_settings -id CLIENT
@@ -93,9 +92,9 @@ src/
 └── bin/             # exchange / client / playback
 ```
 
-## 与 Go 版的契约
+## 契约与线协议
 
-撮合与 REST 保留原有设计。FIX 线协议已经按 4.2 修正，旧 Go 版的 4.4 回报不再作为兼容性依据。当前协议范围、扩展与审计结果见 [FIX 4.2 审计与实现范围](docs/fix42-audit.md)。独立线协议验证：先 `cargo build --bins`，再 `python tests/fix42_wire.py`；字典来源和测试边界见 [tests/README.md](tests/README.md)。
+当前协议范围、扩展与审计结果见 [FIX 4.2 审计与实现范围](docs/fix42-audit.md)。独立线协议验证：先 `cargo build --bins`，再 `python tests/fix42_wire.py`；字典来源和测试边界见 [tests/README.md](tests/README.md)。
 
 ## 排错
 

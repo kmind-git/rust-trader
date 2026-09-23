@@ -97,11 +97,11 @@ RHEL 验收由现代控制机通过 SSH 或人工命令驱动，目标机只需�
 /etc/rust-trader/
 ├── qf_got_settings               # 本机 FIX 配置，升级不覆盖
 └── instruments.txt              # 本机品种表，升级不覆盖
-/var/log/rust-trader/fix/         # gotrader 可写的会话日志
+/var/log/rust-trader/fix/         # rusttrader 可写的会话日志
 /etc/systemd/system/rust-trader.service
 ```
 
-运行账户使用现有方案的 `gotrader`，系统账户、无交互登录。程序与版本目录由 root 持有，运行账户只需读/执行；配置目录建议 root:gotrader、目录 0750、文件 0640；日志目录由 gotrader 写入。安装器只管理明确的项目路径，不递归修改整个 `/opt` 或 `/etc`。
+运行账户使用 `rusttrader`，系统账户、无交互登录。程序与版本目录由 root 持有，运行账户只需读/执行；配置目录建议 root:rusttrader、目录 0750、文件 0640；日志目录由 rusttrader 写入。安装器只管理明确的项目路径，不递归修改整个 `/opt` 或 `/etc`。
 
 安装器先检查系统/架构、包校验、运行账户、配置和日志权限。品种表必须存在、可读且格式正确：当前程序加载失败只打印错误并继续启动，因此不能只看进程存活就判定安装成功。
 
@@ -146,8 +146,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=gotrader
-Group=gotrader
+User=rusttrader
+Group=rusttrader
 WorkingDirectory=/opt/rust-trader/current
 ExecStart=/opt/rust-trader/current/bin/exchange --server -fix /etc/rust-trader/qf_got_settings -instruments /etc/rust-trader/instruments.txt -port 8080
 Environment=RUST_LOG=info
@@ -191,7 +191,7 @@ FIX 与 REST 当前都绑定 `0.0.0.0`，REST 无鉴权，FIX CompID 白名单�
 | 基础功能 | 包内三程序可执行；无 Rust/Python 运行依赖；关闭 stdin 后 exchange 持续服务 |
 | FIX | 声明会话 Logon/Logout、下单/成交/改单/撤单、拒绝、序号恢复、空闲挂单方回报、合并和分段报文 |
 | REST | 品种列表与预期一致，盘口/统计查询正确；已知品种初始空盘口正常 |
-| systemd | 以 gotrader 启停、重启、开机启动；配置/品种表可读、日志可写、退出状态可观察 |
+| systemd | 以 rusttrader 启停、重启、开机启动；配置/品种表可读、日志可写、退出状态可观察 |
 | 安装升级 | 重复安装保留配置，新旧版本切换与失败回滚完成；旧安装可迁移 |
 | 负载 | 在目标机测多 FIX 连接、集中做市商回报、慢接收方、并发 REST，记录日志开/关两组结果 |
 

@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=gotrader
-Group=gotrader
+User=rusttrader
+Group=rusttrader
 WorkingDirectory=/opt/rust-trader
 ExecStart=/opt/rust-trader/exchange --server
 Restart=always
