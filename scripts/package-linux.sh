@@ -40,6 +40,8 @@ cp DEPLOY.md                    "$ROOT/DEPLOY.md"
 # --- ELF gate: x86-64, statically linked, no interpreter, no NEEDED entries ---
 for bin in "$ROOT"/bin/*; do
     name="$(basename "$bin")"
+    echo "--- $name: $(file -b "$bin")"
+    readelf -d "$bin" 2>/dev/null | grep -E 'NEEDED|INTERP' || echo "    (no NEEDED/INTERP entries)"
     file "$bin" | grep -q "ELF 64-bit LSB.*x86-64" || { echo "FATAL: $name is not an x86-64 ELF" >&2; exit 1; }
     file "$bin" | grep -q "statically linked"     || { echo "FATAL: $name is not statically linked" >&2; exit 1; }
     if readelf -l "$bin" | grep -q PT_INTERP; then
@@ -48,7 +50,7 @@ for bin in "$ROOT"/bin/*; do
     if readelf -d "$bin" 2>/dev/null | grep -q NEEDED; then
         echo "FATAL: $name has NEEDED shared library entries" >&2; exit 1
     fi
-    echo "ELF gate OK: $name ($(file -b "$bin" | cut -d, -f1-2))"
+    echo "ELF gate OK: $name"
 done
 
 # --- line-ending / permission sanity for text payload ---
