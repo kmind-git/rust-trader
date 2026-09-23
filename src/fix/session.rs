@@ -333,7 +333,7 @@ pub struct AcceptorConfig {
 /// which client CompIDs may log on
 #[derive(Clone, Debug)]
 pub enum Admission {
-    /// any CompID (go-trader's DynamicSessions=Y behavior)
+    /// any CompID (DynamicSessions=Y)
     Dynamic,
     /// only these client CompIDs (the declared session table)
     Declared(Vec<String>),
@@ -1303,8 +1303,8 @@ fn handle_business(
 
 // ---------- initiator (client side) ----------
 
-/// client-side view of an order (mirrors what the Go connector tracks in
-/// c.orders and hands to OnOrderStatus)
+/// client-side view of an order, tracked by the initiator and handed to
+/// callbacks
 #[derive(Clone, Debug)]
 pub struct OrderView {
     pub id: OrderId,

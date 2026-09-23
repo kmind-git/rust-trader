@@ -1,6 +1,6 @@
-use gotrader::core::exchange::{Engine, Report};
-use gotrader::market_data::InstrumentSnapshot;
-use gotrader::queue;
+use rust_trader::core::exchange::{Engine, Report};
+use rust_trader::market_data::InstrumentSnapshot;
+use rust_trader::queue;
 use rust_decimal::Decimal;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc::Receiver, Arc, Barrier};

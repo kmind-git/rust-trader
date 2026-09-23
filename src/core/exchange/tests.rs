@@ -5,7 +5,6 @@ use rust_decimal::Decimal;
 use super::*;
 use crate::core::order::{OrderState, OrderType, Side};
 
-/// translated from exchange_test.go TestExchangeLevelBasics
 #[test]
 fn test_exchange_level_basics() {
     let mut engine = Engine::new();
@@ -116,7 +115,7 @@ fn test_exchange_level_basics() {
     );
     assert_eq!(err, Err(EngineError::OrderIsNotActive));
 
-    // report flow assertions (beyond the Go test: verifies the report wiring)
+    // report flow assertions (verifies the report wiring)
     let mut c1_status = 0;
     let mut c1_fill = 0;
     for report in rx1.try_iter() {

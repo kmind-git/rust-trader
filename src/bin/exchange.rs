@@ -1,14 +1,14 @@
 use std::sync::{Arc, Mutex};
 
-use gotrader::core::exchange::Engine;
-use gotrader::core::orderbook::Book;
-use gotrader::fix::config::{ConfigError, FixConfig, SessionSettings};
-use gotrader::fix::log::LogConfig;
-use gotrader::fix::session::{run_acceptor, AcceptorConfig, Admission};
-use gotrader::rest;
+use rust_trader::core::exchange::Engine;
+use rust_trader::core::orderbook::Book;
+use rust_trader::fix::config::{ConfigError, FixConfig, SessionSettings};
+use rust_trader::fix::log::LogConfig;
+use rust_trader::fix::session::{run_acceptor, AcceptorConfig, Admission};
+use rust_trader::rest;
 
 fn main() {
-    let mut fix_path = "configs/qf_got_settings".to_string();
+    let mut fix_path = "configs/qf_exchange_settings".to_string();
     let mut instruments_path = "configs/instruments.txt".to_string();
     let mut port = "8080".to_string();
     let mut server_mode = false;
@@ -226,7 +226,7 @@ fn die(message: &str) -> ! {
 }
 
 fn format_book(symbol: &str, book: &Book) -> String {
-    let levels = |levels: &[gotrader::core::orderbook::BookLevel]| -> String {
+    let levels = |levels: &[rust_trader::core::orderbook::BookLevel]| -> String {
         levels
             .iter()
             .map(|l| format!("{} @ {}", l.quantity, l.price))

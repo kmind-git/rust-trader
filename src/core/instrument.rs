@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::BufRead;
 
-/// a tradable instrument; mirrors common.Instrument
+/// a tradable instrument
 #[derive(Clone, Debug, PartialEq)]
 pub struct Instrument {
     pub id: i64,
@@ -14,7 +14,7 @@ impl Instrument {
     }
 }
 
-/// instrument registry; mirrors common.IMap (instrumentmap.go)
+/// instrument registry; bidirectional symbol/id lookup
 #[derive(Default)]
 pub struct InstrumentMap {
     by_symbol: HashMap<String, Instrument>,
@@ -35,7 +35,7 @@ impl InstrumentMap {
         self.by_id.get(&id)
     }
 
-    /// sorted for deterministic output (Go map iteration order is random)
+    /// sorted for deterministic output
     pub fn all_symbols(&self) -> Vec<String> {
         let mut symbols: Vec<String> = self.by_symbol.keys().cloned().collect();
         symbols.sort();
@@ -54,7 +54,7 @@ impl InstrumentMap {
     }
 
     /// load "INSTRUMENT_ID SYMBOL" lines from a reader; '#' or '//' lines are
-    /// comments. mirrors IMap.Load in Go.
+    /// comments.
     pub fn load_from_reader<R: BufRead>(&mut self, reader: R) -> std::io::Result<()> {
         for line in reader.lines() {
             let s = line?;

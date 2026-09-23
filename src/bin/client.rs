@@ -1,10 +1,10 @@
 use std::io::BufRead;
 
-use gotrader::core::instrument::Instrument;
-use gotrader::core::order::Side;
-use gotrader::fix::config::{ConfigError, FixConfig, SessionSettings};
-use gotrader::fix::log::LogConfig;
-use gotrader::fix::session::{Callback, FillView, Initiator, InitiatorConfig, OrderView};
+use rust_trader::core::instrument::Instrument;
+use rust_trader::core::order::Side;
+use rust_trader::fix::config::{ConfigError, FixConfig, SessionSettings};
+use rust_trader::fix::log::LogConfig;
+use rust_trader::fix::session::{Callback, FillView, Initiator, InitiatorConfig, OrderView};
 
 struct PrintCallback;
 
@@ -140,14 +140,14 @@ fn main() {
                 };
                 let result = if parts.len() == 4 {
                     match parts[3].parse::<rust_decimal::Decimal>() {
-                        Ok(price) => initiator.create_order(symbol, side, gotrader::core::order::OrderType::Limit, price, quantity),
+                        Ok(price) => initiator.create_order(symbol, side, rust_trader::core::order::OrderType::Limit, price, quantity),
                         Err(_) => {
                             println!("invalid price {}", parts[3]);
                             continue;
                         }
                     }
                 } else {
-                    initiator.create_order(symbol, side, gotrader::core::order::OrderType::Market, rust_decimal::Decimal::ZERO, quantity)
+                    initiator.create_order(symbol, side, rust_trader::core::order::OrderType::Market, rust_decimal::Decimal::ZERO, quantity)
                 };
                 if let Err(_) = result {
                     println!("unable to submit order: not connected");

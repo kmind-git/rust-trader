@@ -1,5 +1,5 @@
 //! encode/decode of the FIX messages this exchange speaks. Field semantics
-//! mirror the Go implementation (quickfixgo message crates + common/fix.go).
+//! mirror the quickfixgo message crates.
 
 use rust_decimal::Decimal;
 

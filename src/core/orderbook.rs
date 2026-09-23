@@ -31,7 +31,6 @@ impl Book {
 }
 
 /// a trade produced by matching, with post-fill snapshots of both sides
-/// (mirrors the internal `trade` struct in Go)
 #[derive(Clone, Debug)]
 pub struct RawTrade {
     pub buyer: Order,
@@ -112,8 +111,7 @@ impl PriceLevel {
 }
 
 /// the order book for one instrument: descending bid levels, ascending ask
-/// levels, FIFO (price-time priority) within a level. Mirrors orderBook +
-/// orderList in Go.
+/// levels, FIFO (price-time priority) within a level.
 #[derive(Debug)]
 pub struct OrderBook {
     pub instrument_id: i64,
@@ -397,7 +395,7 @@ mod tests {
         }
     }
 
-    // --- translated from orderlist_test.go ---
+    // --- order list tests ---
 
     #[test]
     fn test_order_list_push_back() {
@@ -458,7 +456,7 @@ mod tests {
         assert_eq!(level.orders.len(), 0);
     }
 
-    // --- translated from orderbook_test.go ---
+    // --- order book tests ---
 
     #[test]
     fn test_order_book() {
@@ -560,7 +558,7 @@ mod tests {
         assert_eq!(b.bids.len(), 0);
         assert_eq!(b.asks.len(), 0);
         // the fill snapshot shows the fill-time state; the cancelled remainder
-        // shows up in the final state of the order (matches Go report semantics)
+        // shows up in the final state of the order
         assert_eq!(trades[0].seller.state, OrderState::PartialFill);
         assert_eq!(final_state.as_ref().unwrap().state, OrderState::Cancelled);
         assert_eq!(

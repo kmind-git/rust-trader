@@ -1,4 +1,4 @@
-use gotrader::core::{
+use rust_trader::core::{
     order::{Order, Side},
     orderbook::OrderBook,
 };

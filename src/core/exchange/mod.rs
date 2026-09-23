@@ -348,8 +348,8 @@ impl Engine {
         self.send_trade_reports(&mut trades);
         if let Some(final_order) = &final_state {
             self.sync_record(&final_order.clone());
-            // mirror Go: status goes out when nothing traded, OR when a market
-            // order's unfilled remainder was cancelled
+            // status goes out when nothing traded, OR when a market order's
+            // unfilled remainder was cancelled
             let remainder_cancelled =
                 final_order.state == OrderState::Cancelled && new.order_type == OrderType::Market;
             if trades.is_empty() || remainder_cancelled {
@@ -359,7 +359,7 @@ impl Engine {
         Ok(new.id)
     }
 
-    /// mirrors exchange.ModifyOrder: remove + re-add, so time priority resets.
+    /// modify = remove + re-add, so time priority resets.
     /// The replacement order takes the cancel-replace request's ClOrdID
     /// (new_id), and the Replaced report carries OrigClOrdID.
     pub fn modify_order(
@@ -434,8 +434,7 @@ impl Engine {
         ) {
             Ok(removed) => removed,
             Err(_) => {
-                // order exists in the session but not in the book: report and
-                // ignore, mirroring the Go behavior
+                // order exists in the session but not in the book: report and ignore
                 let record = self
                     .sessions
                     .get(session_id)
@@ -859,7 +858,6 @@ impl Engine {
     }
 
     /// keep the session's mirrored order record at the engine's final state
-    /// (in Go this is a shared pointer, so it stays in sync automatically)
     fn sync_record(&mut self, order: &Order) {
         if order.id == QUOTE_ORDER_ID {
             return;

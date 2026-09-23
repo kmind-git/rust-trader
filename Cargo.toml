@@ -6,7 +6,7 @@ description = "A financial exchange with price-time priority matching, a hand-wr
 license = "GPL-2.0"
 
 [lib]
-name = "gotrader"
+name = "rust_trader"
 path = "src/lib.rs"
 
 [[bin]]

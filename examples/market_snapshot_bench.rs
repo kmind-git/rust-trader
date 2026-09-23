@@ -1,7 +1,7 @@
-use gotrader::core::exchange::{Engine, NewOrder, Report};
-use gotrader::core::order::{OrderType, Side};
-use gotrader::market_data::MarketDataReader;
-use gotrader::queue;
+use rust_trader::core::exchange::{Engine, NewOrder, Report};
+use rust_trader::core::order::{OrderType, Side};
+use rust_trader::market_data::MarketDataReader;
+use rust_trader::queue;
 use rust_decimal::Decimal;
 use std::hint::black_box;
 use std::sync::{mpsc::Receiver, Arc, Barrier, Mutex};

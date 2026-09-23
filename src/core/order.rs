@@ -37,7 +37,7 @@ pub enum OrderState {
 }
 
 impl OrderState {
-    /// mirrors common.Order.IsActive in the Go implementation
+    /// an order can still trade unless it reached a terminal state
     pub fn is_active(&self) -> bool {
         !matches!(
             self,
@@ -67,8 +67,8 @@ pub struct Order {
     /// fill and is carried through cancel/replace operations.
     pub avg_price: Decimal,
     pub state: OrderState,
-    /// global monotonic arrival counter; replaces Go's time.Now() ordering and
-    /// gives deterministic FIFO priority within a price level
+    /// global monotonic arrival counter; gives deterministic FIFO priority
+    /// within a price level
     pub arrival: u64,
 }
 
@@ -123,7 +123,7 @@ impl Order {
     }
 
     /// the "effective price" used for ordering, so market orders always sit at
-    /// the top of their side (mirrors sessionOrder.getPrice in Go)
+    /// the top of their side
     pub fn effective_price(&self) -> Decimal {
         match self.order_type {
             OrderType::Market => match self.side {

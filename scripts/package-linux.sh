@@ -29,7 +29,7 @@ for bin in exchange client playback; do
     cp "$src" "$ROOT/bin/$bin"
     chmod 755 "$ROOT/bin/$bin"
 done
-cp configs/qf_got_settings      "$ROOT/configs/qf_got_settings.example"
+cp configs/qf_exchange_settings  "$ROOT/configs/qf_exchange_settings.example"
 cp configs/qf_connector_settings "$ROOT/configs/qf_connector_settings.example"
 cp configs/instruments.txt      "$ROOT/configs/instruments.txt.example"
 cp configs/playback.txt         "$ROOT/examples/playback.txt"

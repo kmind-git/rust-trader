@@ -1,8 +1,8 @@
 use std::io::BufRead;
 
-use gotrader::fix::config::{ConfigError, FixConfig, SessionSettings};
-use gotrader::fix::log::LogConfig;
-use gotrader::fix::session::{Callback, Initiator, InitiatorConfig};
+use rust_trader::fix::config::{ConfigError, FixConfig, SessionSettings};
+use rust_trader::fix::log::LogConfig;
+use rust_trader::fix::session::{Callback, Initiator, InitiatorConfig};
 
 struct NopCallback;
 
@@ -10,7 +10,6 @@ impl Callback for NopCallback {}
 
 /// parse a playback timestamp: "+5s"/"+100ms"/"+2min" style relative offsets, or
 /// absolute epoch milliseconds (diffed against the previous line).
-/// Mirrors calcDuration in the Go implementation.
 fn calc_duration(
     last_timestamp: Option<&str>,
     timestamp: &str,

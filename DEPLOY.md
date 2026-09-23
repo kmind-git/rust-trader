@@ -8,7 +8,7 @@
 rust-trader-<版本>-linux-x86_64/
 ├── exchange                      # 交易所主程序（musl 静态二进制）
 ├── configs/                      # FIX 配置、品种表、回放样例
-│   ├── qf_got_settings           #   acceptor：端口/CompID/准入白名单 TargetCompIDs/Logging
+│   ├── qf_exchange_settings           #   acceptor：端口/CompID/准入白名单 TargetCompIDs/Logging
 │   ├── instruments.txt           #   品种表
 │   └── ...
 ├── systemd/rust-trader.service   # systemd 服务文件
@@ -51,7 +51,7 @@ journalctl -u rust-trader -f
 
 ## 准入控制
 
-`configs/qf_got_settings` 的 `TargetCompIDs` 声明允许接入的客户端 CompID（如 `CLIENT,PLAYBACK`）；`DynamicSessions=Y` 可恢复"任意接入"模式。未声明客户端在 Logon 阶段即被拒绝。
+`configs/qf_exchange_settings` 的 `TargetCompIDs` 声明允许接入的客户端 CompID（如 `CLIENT,PLAYBACK`）；`DynamicSessions=Y` 可恢复"任意接入"模式。未声明客户端在 Logon 阶段即被拒绝。
 
 ## 停止 / 升级
 

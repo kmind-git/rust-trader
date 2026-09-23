@@ -39,7 +39,7 @@ curl http://localhost:8080/api/sessions
 
 交易所交互控制台：`help` / `sessions` / `book SYMBOL` / `list` / `quit`。
 
-FIX 接入采用 QuickFIX 的预定义会话表：`configs/qf_got_settings` 的每个 `[SESSION]` 通过 `TargetCompID` 声明一个允许的客户端 CompID（未声明即拒，见 [docs/adr/0006-declared-session-admission.md](docs/adr/0006-declared-session-admission.md)）；`DynamicSessions=Y` 是本项目扩展，可恢复任意接入。`qf_connector_settings` 同时声明 `CLIENT` 和 `PLAYBACK` 两个 initiator，两个工具用 `-id` 选择对应会话。
+FIX 接入采用 QuickFIX 的预定义会话表：`configs/qf_exchange_settings` 的每个 `[SESSION]` 通过 `TargetCompID` 声明一个允许的客户端 CompID（未声明即拒，见 [docs/adr/0006-declared-session-admission.md](docs/adr/0006-declared-session-admission.md)）；`DynamicSessions=Y` 是本项目扩展，可恢复任意接入。`qf_connector_settings` 同时声明 `CLIENT` 和 `PLAYBACK` 两个 initiator，两个工具用 `-id` 选择对应会话。
 
 ## FIX settings
 

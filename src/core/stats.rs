@@ -1,7 +1,6 @@
 use rust_decimal::Decimal;
 
-/// running per-instrument statistics, updated synchronously by the matching
-/// path (mirrors the Statistics struct in Go's marketdata.go, now in stats.go)
+/// running per-instrument statistics, updated synchronously by the matching path
 #[derive(Clone, Debug, Default)]
 pub struct Statistics {
     pub symbol: String,

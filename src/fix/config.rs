@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn checked_in_quickfix_samples_resolve_their_sessions() {
         let acceptor =
-            FixConfig::load(include_str!("../../configs/qf_got_settings").as_bytes()).unwrap();
+            FixConfig::load(include_str!("../../configs/qf_exchange_settings").as_bytes()).unwrap();
         // CLIENT, PLAYBACK and ORDERHUB are declared in the checked-in sample
         assert_eq!(acceptor.acceptors().len(), 3);
         assert_eq!(

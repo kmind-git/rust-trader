@@ -44,7 +44,7 @@ rust-trader-<release-id>-linux-x86_64-musl/
 │   ├── client
 │   └── playback
 ├── configs/
-│   ├── qf_got_settings.example
+│   ├── qf_exchange_settings.example
 │   ├── qf_connector_settings.example
 │   └── instruments.txt.example
 ├── examples/playback.txt
@@ -95,7 +95,7 @@ RHEL 验收由现代控制机通过 SSH 或人工命令驱动，目标机只需�
 ├── releases/<release-id>/        # root 持有的不可变版本目录
 └── current -> releases/<release-id>
 /etc/rust-trader/
-├── qf_got_settings               # 本机 FIX 配置，升级不覆盖
+├── qf_exchange_settings               # 本机 FIX 配置，升级不覆盖
 └── instruments.txt              # 本机品种表，升级不覆盖
 /var/log/rust-trader/fix/         # rusttrader 可写的会话日志
 /etc/systemd/system/rust-trader.service
@@ -109,7 +109,7 @@ RHEL 验收由现代控制机通过 SSH 或人工命令驱动，目标机只需�
 
 ## 6. FIX 配置与启动
 
-以下为将来安装到 `/etc/rust-trader/qf_got_settings` 的示例，使用现有解析器已支持的键；CompID 与端口部署时替换为本机要求。
+以下为将来安装到 `/etc/rust-trader/qf_exchange_settings` 的示例，使用现有解析器已支持的键；CompID 与端口部署时替换为本机要求。
 
 ```ini
 [DEFAULT]
@@ -149,7 +149,7 @@ Type=simple
 User=rusttrader
 Group=rusttrader
 WorkingDirectory=/opt/rust-trader/current
-ExecStart=/opt/rust-trader/current/bin/exchange --server -fix /etc/rust-trader/qf_got_settings -instruments /etc/rust-trader/instruments.txt -port 8080
+ExecStart=/opt/rust-trader/current/bin/exchange --server -fix /etc/rust-trader/qf_exchange_settings -instruments /etc/rust-trader/instruments.txt -port 8080
 Environment=RUST_LOG=info
 UMask=0027
 Restart=on-failure

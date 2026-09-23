@@ -6,8 +6,8 @@ use serde::Serialize;
 use crate::core::exchange::Engine;
 use crate::market_data::{InstrumentSnapshot, MarketDataReader};
 
-/// read-only REST api mirroring the Go implementation's endpoints and JSON
-/// field names exactly (internal/exchange/webserver.go).
+/// read-only REST api; endpoint paths and JSON field names are part of the
+/// public contract and must not drift.
 
 #[derive(Serialize)]
 struct LevelDto {
