@@ -5,13 +5,16 @@
 ## 包内容
 
 ```
-rust-trader-<版本>-linux-x86_64/
-├── exchange                      # 交易所主程序（musl 静态二进制）
-├── configs/                      # FIX 配置、品种表、回放样例
-│   ├── qf_exchange_settings           #   acceptor：端口/CompID/准入白名单 TargetCompIDs/Logging
-│   ├── instruments.txt           #   品种表
-│   └── ...
+rust-trader-<版本>-linux-x86_64-musl/
+├── bin/                          # musl 静态二进制
+│   ├── exchange                  #   交易所主程序
+│   ├── client                    #   自研客户端
+│   └── playback                  #   报价回放
+├── configs/                      # *.example 配置模板（qf_exchange_settings / qf_connector_settings / instruments.txt）
+├── examples/playback.txt         # 回放样例
 ├── systemd/rust-trader.service   # systemd 服务文件
+├── SHA256SUMS / BUILD-INFO.json  # 包内文件校验与构建信息
+├── LICENSE
 └── DEPLOY.md                     # 本手册
 ```
 
@@ -23,18 +26,23 @@ useradd -r -s /sbin/nologin rusttrader
 
 # 2. 解压到 /opt/rust-trader
 mkdir -p /opt/rust-trader
-tar xzf rust-trader-*-linux-x86_64.tar.gz -C /opt/rust-trader --strip-components=1
+tar xzf rust-trader-*-linux-x86_64*.tar.gz -C /opt/rust-trader --strip-components=1
 chown -R rusttrader:rusttrader /opt/rust-trader
 
-# 3. 安装并启动服务
+# 3. 首次安装：从 .example 生成配置（已有配置保持原样）
+cd /opt/rust-trader/configs
+cp -n qf_exchange_settings.example qf_exchange_settings
+cp -n instruments.txt.example instruments.txt
+
+# 4. 安装并启动服务
 cp /opt/rust-trader/systemd/rust-trader.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now rust-trader
 
-# 4. 开放端口（FIX 5001 / REST 8080）
+# 5. 开放端口（FIX 5001 / REST 8080）
 firewall-cmd --permanent --add-port=5001/tcp --add-port=8080/tcp && firewall-cmd --reload
 
-# 5. 验证
+# 6. 验证
 curl http://localhost:8080/api/instruments/
 journalctl -u rust-trader -f
 ```
@@ -45,7 +53,7 @@ journalctl -u rust-trader -f
 
 | 路径 | 内容 |
 |---|---|
-| `/opt/rust-trader/exchange` | 主程序 |
+| `/opt/rust-trader/bin/exchange` | 主程序（包内二进制位于 `bin/` 目录） |
 | `/opt/rust-trader/configs/` | 配置（改 `TargetCompIDs` 准入白名单、`Logging` 日志开关后需重启） |
 | `/opt/rust-trader/logs/exchange/` | FIX 会话日志（messages/event，每接入会话一对文件，行前缀北京时间） |
 

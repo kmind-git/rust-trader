@@ -1,6 +1,6 @@
 # RHEL 7.6 打包与部署方案
 
-日期：2026-09-16。代码基线：`e44f1ff7be8dc018423cbc3aae1694730d951955`。状态：方案，尚未实施或生成 Linux 发布包。
+日期：2026-09-16。代码基线：`e44f1ff7be8dc018423cbc3aae1694730d951955`。状态更新 2026-09-25：P1 已实施，GitHub Actions 固定构建已产出 musl 候选包（workflow `release.yml`，artifact `linux-x86_64-musl-candidate`，通过 RHEL 7.6 验收前均为候选）；P2/P3 部分文件就位（`DEPLOY.md`、`deploy/rust-trader.service`、`tests/deployment_smoke.py`），安装/升级/回滚脚本待补；P4 目标机验收未开始。
 
 用户指定操作系统为 Red Hat Enterprise Linux 7.6；CPU 暂沿用仓库现有的 x86_64 目标，实施前用 `uname -m` 确认。首版交付采用 **Linux CI 构建 musl 静态二进制、tar.gz 离线安装、systemd 托管、真实 RHEL 7.6 验收**。服务器运行时不需要安装 Rust、Cargo、Docker 或 Python。
 

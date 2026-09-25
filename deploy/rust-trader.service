@@ -8,7 +8,7 @@ Type=simple
 User=rusttrader
 Group=rusttrader
 WorkingDirectory=/opt/rust-trader
-ExecStart=/opt/rust-trader/exchange --server
+ExecStart=/opt/rust-trader/bin/exchange --server
 Restart=always
 RestartSec=3
 

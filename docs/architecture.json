@@ -92,7 +92,7 @@
       "type": "backend",
       "label": "FIX acceptor :5001",
       "sublabel": "手写 FIX 4.2 会话层",
-      "tag": "动态会话",
+      "tag": "预定义会话准入",
       "pos": [
         330,
         285
@@ -248,7 +248,7 @@
       "dot": "cyan",
       "title": "接入",
       "items": [
-        "FIX 4.2 acceptor :5001，动态会话、断线重置序列号",
+        "FIX 4.2 acceptor :5001，预定义会话准入、断线重置序列号",
         "REST :8080 只读四端点（instruments / book / stats / sessions）",
         "无持久化：进程内存态，重启即清零"
       ]
