@@ -10,7 +10,7 @@ import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "target" / "deployment-smoke" / str(time.time_ns())
+OUT = ROOT / "target" / "test-runs" / "deployment-smoke" / str(time.time_ns())
 OUT.mkdir(parents=True)
 EXE = ROOT / "target/debug" / ("exchange.exe" if os.name == "nt" else "exchange")
 
@@ -71,23 +71,31 @@ TargetCompID=CLIENT
 
 launch(True)
 launch(False)
-assert "ExecStart=/opt/rust-trader/exchange --server" in (ROOT / "deploy/rust-trader.service").read_text()
+assert "ExecStart=/opt/rust-trader/exchange --server" in (ROOT / "deploy/rust-trader.service").read_text(encoding="utf-8")
 print("PASS: --server survives stdin EOF with REST/FIX available; interactive EOF exits")
 
-# Exercise the workflow's actual tar command with a local fixture, not a Linux build.
-workflow = (ROOT / ".github/workflows/release.yml").read_text()
+# Exercise the workflow's actual packaging script and artifact paths with a local fixture, not a Linux build.
+workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+packager = (ROOT / "scripts/package-linux.sh").read_text(encoding="utf-8")
+assert "scripts/package-linux.sh" in workflow, "workflow must package via scripts/package-linux.sh"
 name = "rust-trader-smoke-linux-x86_64"
-stage = OUT / "dist" / name
-(stage / "systemd").mkdir(parents=True)
-(stage / "exchange").write_text("packaging fixture")
-(stage / "systemd/rust-trader.service").write_bytes((ROOT / "deploy/rust-trader.service").read_bytes())
-command = next(line.strip() for line in workflow.splitlines() if line.strip().startswith("tar czf "))
-subprocess.run(shlex.split(command.replace("${D}", name)), cwd=OUT, check=True)
+stage = OUT / "dist"
+(stage / name / "bin").mkdir(parents=True)
+(stage / name / "bin" / "exchange").write_text("packaging fixture")
+(stage / name / "systemd").mkdir()
+(stage / name / "systemd/rust-trader.service").write_bytes((ROOT / "deploy/rust-trader.service").read_bytes())
+tar_line = next(l.strip() for l in packager.splitlines() if l.strip().startswith("tar -czf "))
+command = (tar_line
+           .replace('"$OUT_DIR/$PKG.tar.gz"', f"dist/{name}.tar.gz")
+           .replace('"$STAGE"', "dist")
+           .replace('"$PKG"', name))
+subprocess.run(shlex.split(command), cwd=OUT, check=True)
 pattern = next(line.strip().split(": ", 1)[1] for line in workflow.splitlines() if line.strip().startswith("path: "))
-archives = list(OUT.glob(pattern))
-assert len(archives) == 1, "artifact glob does not match the generated archive"
-with tarfile.open(archives[0]) as archive:
-    assert f"{name}/exchange" in archive.getnames()
+archives = [p for p in OUT.glob(pattern) if p.is_file()]
+tarball = next((p for p in archives if p.name.endswith(".tar.gz")), None)
+assert tarball is not None, "artifact glob does not match the generated archive"
+with tarfile.open(tarball) as archive:
+    assert f"{name}/bin/exchange" in archive.getnames()
     assert f"{name}/systemd/rust-trader.service" in archive.getnames()
 assert "dist/*.tar.gz" in workflow.split("gh release create", 1)[1]
-print("PASS: workflow tar output matches artifact/release path and contains expected files")
+print("PASS: packaging tar layout matches artifact/release path and contains expected files")

@@ -196,6 +196,7 @@ mod tests {
     fn test_dir(name: &str) -> PathBuf {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target")
+            .join("test-runs")
             .join("fix-log-tests")
             .join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

@@ -1,6 +1,6 @@
 """Independent FIX 4.2 socket regression; stdlib only.
 Run after cargo build: python tests/fix42_wire.py
-All generated settings and process output stay in target/fix42-wire/.
+All generated settings and process output stay in target/test-runs/fix42-wire/.
 """
 from pathlib import Path
 import datetime as dt
@@ -147,7 +147,7 @@ def free_port():
 
 def check_outbound(binary):
     """Use an independent mock acceptor to inspect our client/playback bytes."""
-    out = ROOT / "target/fix42-wire"
+    out = ROOT / "target/test-runs/fix42-wire"
     with socket.socket() as listener, (out / f"{binary}.log").open("w") as log:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
@@ -212,7 +212,7 @@ Logging=N
             peer.until(lambda m: m[35] == "5")
             peer.send("5")
             proc.wait(timeout=5)
-            assert proc.returncode == 0, (out / f"{binary}.log").read_text()
+            assert proc.returncode == 0, (out / f"{binary}.log").read_text(encoding="utf-8", errors="replace")
             print(f"PASS: {binary} outbound messages pass independent FIX42 dictionary validation")
         finally:
             if peer:
@@ -222,7 +222,7 @@ Logging=N
                 proc.wait()
 
 def run():
-    out = ROOT / "target/fix42-wire"
+    out = ROOT / "target/test-runs/fix42-wire"
     out.mkdir(parents=True, exist_ok=True)
     port, http = free_port(), free_port()
     session_log = out / f"session-log-{time.time_ns()}"

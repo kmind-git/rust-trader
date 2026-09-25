@@ -6,7 +6,7 @@ Run after building the exchange binary::
     python tests/fix_delivery.py --release
 
 The script starts an isolated local exchange and writes every generated file
-under ``target/fix-delivery/<run-id>/``.  It intentionally sends no heartbeat
+under ``target/test-runs/fix-delivery/<run-id>/``.  It intentionally sends no heartbeat
 from the maker while the maker is waiting for the taker's order.  The two
 second receive deadline is only a bounded regression guard; reported timings
 include Python, socket, and message-validation work and are not a production
@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - useful when loaded as tests.fix_delive
     from tests.fix42_wire import ROOT, SOH, free_port, timestamp, validate, wire
 
 
-OUT_ROOT = ROOT / "target" / "fix-delivery"
+OUT_ROOT = ROOT / "target" / "test-runs" / "fix-delivery"
 DELIVERY_TIMEOUT = 2.0
 LOGOUT_CLOSE_TIMEOUT = 1.0
 CYCLES = 5

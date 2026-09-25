@@ -129,6 +129,6 @@ Arc 快照解决读取复制，不自动解决写侧 O(L) 物化。可先在现�
 ## 8. 本轮验证材料
 
 - `cargo build --release --bin exchange` 成功。
-- [成交回报探针](D:/projects/zcodeworkspace/rust-trader/target/performance-review/delivery_probe.py) 与 [结果 JSON](D:/projects/zcodeworkspace/rust-trader/target/performance-review/current-report-latency.json)，包括基线提交、二进制 SHA-256 与进程退出确认。
-- [独立 socket 超时复现](D:/projects/zcodeworkspace/rust-trader/target/performance-review/socket_timeout_probe.rs) 与 [结果](D:/projects/zcodeworkspace/rust-trader/target/performance-review/socket-timeout-result.txt)。
-- 材料位于当前项目 `target/performance-review`，不修改配置源文件和业务代码。没有在本轮重跑全量回归，也没有修改、提交或推送新架构实现。
+- [成交回报探针](D:/projects/zcodeworkspace/rust-trader/target/test-runs/performance-review/delivery_probe.py) 与 [结果 JSON](D:/projects/zcodeworkspace/rust-trader/target/test-runs/performance-review/current-report-latency.json)，包括基线提交、二进制 SHA-256 与进程退出确认。
+- [独立 socket 超时复现](D:/projects/zcodeworkspace/rust-trader/target/test-runs/performance-review/socket_timeout_probe.rs) 与 [结果](D:/projects/zcodeworkspace/rust-trader/target/test-runs/performance-review/socket-timeout-result.txt)。
+- 材料位于当前项目 `target/test-runs/performance-review`，不修改配置源文件和业务代码。没有在本轮重跑全量回归，也没有修改、提交或推送新架构实现。

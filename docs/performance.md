@@ -41,7 +41,7 @@
 
 这是读取路径微基准，不含 JSON、TCP 或持续撮合，不是完整旧版与新版发行程序的端到端对比。当前兼容 `Engine::book()` 也从发布槽取得数据再深复制，因此不能将此表解释为精确重现旧版所有开销。样本有明显调度波动：4 读者的新路径单轮为 26.341–141.744 ms，应使用重复测量而非挑最快值。另测当前实现单品种断连清理 8000 单为 40.961 ms，仅一个样本，没有旧版对照。
 
-原始 5 轮数据：[CSV](D:/projects/zcodeworkspace/rust-trader/target/performance-review/market-snapshot-bench-20260915.csv)。基准源代码：[market_snapshot_bench.rs](D:/projects/zcodeworkspace/rust-trader/examples/market_snapshot_bench.rs)。
+原始 5 轮数据：[CSV](D:/projects/zcodeworkspace/rust-trader/target/test-runs/performance-review/market-snapshot-bench-20260915.csv)。基准源代码：[market_snapshot_bench.rs](D:/projects/zcodeworkspace/rust-trader/examples/market_snapshot_bench.rs)。
 
 验证：`cargo test --locked --offline` 通过 59 项库测试及 3 项行情集成测试，共 62 项；`cargo build --locked --offline` 通过。独立 FIX42 字典/TCP 测试通过 exchange、client、playback 三端场景。已检查改动文件格式与 diff。尚未测量生产端到端 p99、持续交易吞吐或长期 RSS；Arc 的分配/回收、全量深度构建和 JSON 生成仍有成本。
 
@@ -56,9 +56,9 @@
 | 范围 | 1.137–3.136 ms | 1.060–6.134 ms |
 | 中位数 | 1.376 ms | 1.868 ms |
 
-先前基线的两次空闲 MAKER 诊断为 9987.933 ms 与 9806.095 ms，见 [原始基线](../target/performance-review/current-report-latency.json)。本次五轮均未出现原先接近 10 秒的等待。两次诊断的数量、首轮握手方式及样本数不同，不能据此计算整体系统加速倍数，也不能充当生产 p99 或同输入交替 A/B 性能验收。输入缓冲有模拟 Read 次数的回归证据，尚未分别测量其真实 syscall 数量或独立吞吐收益。
+先前基线的两次空闲 MAKER 诊断为 9987.933 ms 与 9806.095 ms，见 [原始基线](../target/test-runs/performance-review/current-report-latency.json)。本次五轮均未出现原先接近 10 秒的等待。两次诊断的数量、首轮握手方式及样本数不同，不能据此计算整体系统加速倍数，也不能充当生产 p99 或同输入交替 A/B 性能验收。输入缓冲有模拟 Read 次数的回归证据，尚未分别测量其真实 syscall 数量或独立吞吐收益。
 
-本次原始结果：[release JSON](../target/fix-delivery/1789485125468132700/diagnostic.json)、[debug JSON](../target/fix-delivery/1789485021456686800/diagnostic.json)。测试配置和进程日志保存在对应目录，进程在脚本 finally 中清理。
+本次原始结果：[release JSON](../target/test-runs/fix-delivery/1789485125468132700/diagnostic.json)、[debug JSON](../target/test-runs/fix-delivery/1789485021456686800/diagnostic.json)。测试配置和进程日志保存在对应目录，进程在脚本 finally 中清理。
 
 验证：63 项库测试及 3 项行情集成测试通过，共 66 项。debug 构建、release exchange 构建、独立 FIX42 字典/TCP 三端回归，以及 debug/release 的五轮真实 TCP 投递回归通过。投递回归同时验证合并发送的 Logon/订单、Logon 回包顺序、双方成交数量/价格、连续序号、唯一 ExecID、Logout 后关闭；Rust 测试覆盖单方满载不阻塞另一方和最终 Logout 后不发送已排队消息。
 
