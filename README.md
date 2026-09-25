@@ -183,3 +183,7 @@ src/
 - **FIX 会话日志在哪**：acceptor 写 `logs/exchange/{BeginString-Sender-Target}.messages|event.current.log`；client 写 `logs/client/`、playback 写 `logs/playback/`。messages 记每条收发报文原文（`in`/`out` 方向前缀，含心跳），帧损坏时保留 `in-hex` 的无损十六进制；event 记会话事件（登录/注销/序列号/超时，措辞对齐 QuickFIX/Go）。`Logging=Y/N`（默认 Y）与 `FileLogPath` 可覆盖，见 [ADR-0005](docs/adr/0005-fix-session-logs.md)。日志行时间使用 UTC+8，FIX 报文字段时间仍按 UTC。
 - **Windows 构建报 exe 被占用 / 运行报 os error 10048**：残留的 exchange/client/playback 进程锁住了 target 下的 exe 或 8080/5001 端口，先结束残留进程再构建/运行。
 </details>
+
+## 许可
+
+[MIT](LICENSE) © 2026 kmind-git
