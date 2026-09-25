@@ -7,7 +7,6 @@
 [![release](https://github.com/kmind-git/rust-trader/actions/workflows/release.yml/badge.svg)](https://github.com/kmind-git/rust-trader/actions/workflows/release.yml)
 [![rust](https://img.shields.io/badge/rust-1.98.1-orange)](./rust-toolchain.toml)
 [![platform](https://img.shields.io/badge/platform-x86__64%20musl%20%7C%20Windows-green)](./DEPLOY.md)
-[![license](https://img.shields.io/badge/license-GPL--2.0-blue)](./LICENSE)
 
 </div>
 
