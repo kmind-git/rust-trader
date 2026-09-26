@@ -91,7 +91,7 @@ RHEL 验收由现代控制机通过 SSH 或人工命令驱动，目标机只需�
 ## 5. 安装目录与权限
 
 ```text
-/opt/rust-trader/
+/home/rust-trader/
 ├── releases/<release-id>/        # root 持有的不可变版本目录
 └── current -> releases/<release-id>
 /etc/rust-trader/
@@ -148,8 +148,8 @@ After=network.target
 Type=simple
 User=rusttrader
 Group=rusttrader
-WorkingDirectory=/opt/rust-trader/current
-ExecStart=/opt/rust-trader/current/bin/exchange --server -fix /etc/rust-trader/qf_exchange_settings -instruments /etc/rust-trader/instruments.txt -port 8080
+WorkingDirectory=/home/rust-trader/current
+ExecStart=/home/rust-trader/current/bin/exchange --server -fix /etc/rust-trader/qf_exchange_settings -instruments /etc/rust-trader/instruments.txt -port 8080
 Environment=RUST_LOG=info
 UMask=0027
 Restart=on-failure
@@ -180,7 +180,7 @@ FIX 与 REST 当前都绑定 `0.0.0.0`，REST 无鉴权，FIX CompID 白名单�
 
 **回滚只能恢复程序与配置，不能恢复旧订单、会话序号、成交统计或未送达回报。** 当前状态仅在内存，重启后配置中的品种会重新加载；订单与交易统计重新开始。因此首版不是无停机升级，也没有自动恢复业务连续性的能力。
 
-若目标机已经采用旧版 `/opt/rust-trader/exchange` 原地安装，先识别并备份旧程序、configs、unit 和日志；保持停止状态后再迁移到版本目录与 `/etc`，不能把已有根目录文件当作可清理的暂存内容。
+若目标机已经采用旧版 `/home/rust-trader/exchange` 原地安装，先识别并备份旧程序、configs、unit 和日志；保持停止状态后再迁移到版本目录与 `/etc`，不能把已有根目录文件当作可清理的暂存内容。
 
 ## 8. 验收标准
 

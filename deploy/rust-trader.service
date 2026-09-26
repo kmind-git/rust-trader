@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=simple
 User=rusttrader
 Group=rusttrader
-WorkingDirectory=/opt/rust-trader
-ExecStart=/opt/rust-trader/bin/exchange --server
+WorkingDirectory=/home/rust-trader
+ExecStart=/home/rust-trader/bin/exchange --server
 Restart=always
 RestartSec=3
 

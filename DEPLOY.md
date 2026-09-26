@@ -21,21 +21,21 @@ rust-trader-<版本>-linux-x86_64-musl/
 ## 部署步骤
 
 ```bash
-# 1. 创建运行用户
-useradd -r -s /sbin/nologin rusttrader
+# 1. 创建运行用户（家目录即部署目录）
+useradd -r -m -d /home/rust-trader -s /sbin/nologin rusttrader
 
-# 2. 解压到 /opt/rust-trader
-mkdir -p /opt/rust-trader
-tar xzf rust-trader-*-linux-x86_64*.tar.gz -C /opt/rust-trader --strip-components=1
-chown -R rusttrader:rusttrader /opt/rust-trader
+# 2. 解压到 /home/rust-trader
+mkdir -p /home/rust-trader
+tar xzf rust-trader-*-linux-x86_64*.tar.gz -C /home/rust-trader --strip-components=1
+chown -R rusttrader:rusttrader /home/rust-trader
 
 # 3. 首次安装：从 .example 生成配置（已有配置保持原样）
-cd /opt/rust-trader/configs
+cd /home/rust-trader/configs
 cp -n qf_exchange_settings.example qf_exchange_settings
 cp -n instruments.txt.example instruments.txt
 
 # 4. 安装并启动服务
-cp /opt/rust-trader/systemd/rust-trader.service /etc/systemd/system/
+cp /home/rust-trader/systemd/rust-trader.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now rust-trader
 
@@ -49,13 +49,15 @@ journalctl -u rust-trader -f
 
 服务文件使用 `exchange --server`，关闭标准输入不会导致退出。该模式不自行 fork 或脱离进程，由 systemd 管理启动和停止；手工交互运行仍可使用不带 `--server` 的命令。更新旧部署时需同时替换服务文件并执行 `systemctl daemon-reload`，然后重启服务。
 
+部署在家目录时，SELinux enforcing 的系统（如 CentOS Stream）可能拒绝 systemd 从 `/home` 执行二进制：若启动报 `Permission denied`，执行 `chcon -t bin_t /home/rust-trader/bin/*` 后重启服务即可。
+
 ## 运行时目录与日志
 
 | 路径 | 内容 |
 |---|---|
-| `/opt/rust-trader/bin/exchange` | 主程序（包内二进制位于 `bin/` 目录） |
-| `/opt/rust-trader/configs/` | 配置（改 `TargetCompIDs` 准入白名单、`Logging` 日志开关后需重启） |
-| `/opt/rust-trader/logs/exchange/` | FIX 会话日志（messages/event，每接入会话一对文件，行前缀北京时间） |
+| `/home/rust-trader/bin/exchange` | 主程序（包内二进制位于 `bin/` 目录） |
+| `/home/rust-trader/configs/` | 配置（改 `TargetCompIDs` 准入白名单、`Logging` 日志开关后需重启） |
+| `/home/rust-trader/logs/exchange/` | FIX 会话日志（messages/event，每接入会话一对文件，行前缀北京时间） |
 
 ## 准入控制
 
