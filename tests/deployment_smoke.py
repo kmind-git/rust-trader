@@ -71,7 +71,7 @@ TargetCompID=CLIENT
 
 launch(True)
 launch(False)
-assert "ExecStart=/opt/rust-trader/exchange --server" in (ROOT / "deploy/rust-trader.service").read_text(encoding="utf-8")
+assert "ExecStart=/opt/rust-trader/bin/exchange --server" in (ROOT / "deploy/rust-trader.service").read_text(encoding="utf-8")
 print("PASS: --server survives stdin EOF with REST/FIX available; interactive EOF exits")
 
 # Exercise the workflow's actual packaging script and artifact paths with a local fixture, not a Linux build.

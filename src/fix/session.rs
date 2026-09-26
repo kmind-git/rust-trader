@@ -7,13 +7,14 @@ use crate::queue::{self as mpsc, Sender};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use rust_decimal::Decimal;
 
-use crate::core::exchange::{Engine, NewOrder, Report, ReportSink};
+use crate::core::exchange::{Engine, EngineError, NewOrder, Report, ReportSink};
 use crate::core::instrument::Instrument;
 use crate::core::order::{OrderId, OrderState, OrderType, Side};
 
@@ -960,9 +961,15 @@ fn handle_acceptor_connection(
     let mut last_received = std::time::Instant::now();
     let mut pending_test: Option<(String, std::time::Instant)> = None;
     let mut logout_fields = None;
+    // Reason captured by handle_business when an engine book invariant
+    // fails: replaces the generic queue-overflow log line. (tiered plan §3.5)
+    let mut book_fault: Option<String> = None;
     loop {
         if tx.failed() {
-            session_log.event("Outbound queue overflow/disconnected; closing session");
+            let reason = book_fault
+                .take()
+                .unwrap_or_else(|| "Outbound queue overflow/disconnected".to_string());
+            session_log.event(&format!("{reason}; closing session"));
             let _ = stream.shutdown(std::net::Shutdown::Both);
             break;
         }
@@ -1087,14 +1094,16 @@ fn handle_acceptor_connection(
             | Inbound::CancelRequest { .. }
             | Inbound::CancelReplace { .. }
             | Inbound::MassQuote { .. }) => {
-                handle_business(
+                if let Some(fault) = handle_business(
                     &mut engine.lock().unwrap(),
                     &session_id,
                     &tx,
                     inbound,
                     &ids,
                     msg.seq(),
-                );
+                ) {
+                    book_fault = Some(fault);
+                }
             }
             _ => send_business_reject(
                 &tx,
@@ -1121,6 +1130,19 @@ fn handle_acceptor_connection(
     Ok(())
 }
 
+/// Convert an engine error for the business-reject path. A book invariant
+/// violation fails the connection instead: the flag makes the reader loop
+/// close the session and the returned string is only used for the fault
+/// log, never as a business reject. (tiered plan §3.5)
+fn propagate_engine_fault(tx: &Sender<OutMsg>, error: EngineError) -> String {
+    if let EngineError::BookInvariantViolation(context) = &error {
+        tx.failure_flag().store(true, Ordering::Release);
+        format!("internal book fault: {context}")
+    } else {
+        error.to_string()
+    }
+}
+
 fn fresh_id(ids: &Arc<Mutex<WireIdMap>>, wire: &str) -> Result<i32, String> {
     let mut ids = ids.lock().unwrap();
     if ids.wire_to_internal.contains_key(wire) {
@@ -1136,7 +1158,7 @@ fn handle_business(
     inbound: Inbound,
     ids: &Arc<Mutex<WireIdMap>>,
     _seq: Option<u64>,
-) {
+) -> Option<String> {
     match inbound {
         Inbound::NewOrderSingle {
             cl_ord_id,
@@ -1164,10 +1186,14 @@ fn handle_business(
                             quantity,
                         },
                     )
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| propagate_engine_fault(tx, e))?;
                 Ok::<(), String>(())
             })();
             if let Err(e) = result {
+                if tx.failed() {
+                    // invariant fault already flagged: no business reject
+                    return Some(e);
+                }
                 let mut fields = rejected_execution_fields(
                     &cl_ord_id, None, &symbol, side, order_type, quantity, &e,
                 );
@@ -1204,9 +1230,12 @@ fn handle_business(
                 }
                 engine
                     .cancel_order_with_id(session, original, request)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| propagate_engine_fault(tx, e))
             })();
             if let Err(e) = result {
+                if tx.failed() {
+                    return Some(e);
+                }
                 send_cancel_reject(
                     tx,
                     &cl_ord_id,
@@ -1248,9 +1277,12 @@ fn handle_business(
                 }
                 engine
                     .modify_order_with_type(session, original, request, order_type, price, quantity)
-                    .map_err(|e| e.to_string())
+                    .map_err(|e| propagate_engine_fault(tx, e))
             })();
             if let Err(e) = result {
+                if tx.failed() {
+                    return Some(e);
+                }
                 send_cancel_reject(
                     tx,
                     &cl_ord_id,
@@ -1299,6 +1331,7 @@ fn handle_business(
         }
         _ => {}
     }
+    None
 }
 
 // ---------- initiator (client side) ----------

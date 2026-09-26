@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use rust_trader::core::exchange::Engine;
+use rust_trader::core::exchange::{Engine, FillPolicy, MAX_TIER_FILLS};
 use rust_trader::core::orderbook::Book;
 use rust_trader::fix::config::{ConfigError, FixConfig, SessionSettings};
 use rust_trader::fix::log::LogConfig;
@@ -43,11 +43,6 @@ fn main() {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let engine = Arc::new(Mutex::new(Engine::new()));
-    if let Err(e) = engine.lock().unwrap().load_instruments(&instruments_path) {
-        println!("unable to load instruments: {}", e);
-    }
-
     let fix_config = match FixConfig::load_file(&fix_path) {
         Ok(config) => config,
         Err(e) => die(&format!("unable to load fix settings {fix_path}: {e}")),
@@ -69,6 +64,27 @@ fn main() {
     if let Err(error) = FixConfig::validate_supported_runtime(first) {
         die_config(error);
     }
+    // FillPolicy is validated by the config loader (exact Real/Tiered,
+    // [DEFAULT] only); resolved here before the engine exists so the two
+    // price-key semantics never mix. (tiered plan §3.6)
+    let policy = match first.get("FillPolicy") {
+        Some("Tiered") => FillPolicy::Tiered,
+        Some("Real") | None => FillPolicy::Real,
+        Some(other) => die(&format!("FillPolicy must be Real or Tiered, got {other:?}")),
+    };
+    let engine = Arc::new(Mutex::new(Engine::with_fill_policy(policy)));
+    if let Err(e) = engine.lock().unwrap().load_instruments(&instruments_path) {
+        println!("unable to load instruments: {}", e);
+    }
+    println!(
+        "fill policy: {:?}{}",
+        policy,
+        if matches!(policy, FillPolicy::Tiered) {
+            format!(" (MAX_TIER_FILLS={MAX_TIER_FILLS})")
+        } else {
+            String::new()
+        }
+    );
     let base_log = match LogConfig::from_settings(first, "logs/exchange") {
         Ok(log) => log,
         Err(error) => die_config(error),

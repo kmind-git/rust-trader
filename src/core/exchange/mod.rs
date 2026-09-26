@@ -7,10 +7,81 @@ use rust_decimal::Decimal;
 
 use super::instrument::{Instrument, InstrumentMap};
 use super::order::{Order, OrderId, OrderState, OrderType, Side};
-use super::orderbook::{Book, OrderBook, RawTrade};
+use super::orderbook::{Book, OrderBook, RawTrade, TieredBookError};
 use super::stats::Statistics;
 
 pub const QUOTE_ORDER_ID: OrderId = 0;
+
+/// Single-request cap on tiered fill reports. 256 fills × 100 quantity keeps
+/// the worst case bounded against the 1024-slot outbound queue without a
+/// second configuration knob. (docs/tiered-fill-plan.md §3.1)
+pub const MAX_TIER_FILLS: usize = 256;
+const TIER_CHUNK: i64 = 100;
+/// Raw mantissa/exponent for the fixed tiered market-order price 66.88.
+const TIERED_MARKET_PRICE: (i64, u32) = (6688, 2);
+
+fn tiered_market_price() -> Decimal {
+    Decimal::new(TIERED_MARKET_PRICE.0, TIERED_MARKET_PRICE.1)
+}
+
+fn tier_max_remaining() -> Decimal {
+    Decimal::from(MAX_TIER_FILLS as i64) * Decimal::from(TIER_CHUNK)
+}
+
+/// Quantity-tiered synthetic fill plan. R ≤ 100: no fill; R ≤ 1000: one full
+/// fill; R ≤ 2000: one 50% fill; otherwise repeated 100-lots with a smaller
+/// tail, capped at MAX_TIER_FILLS lots. The plan is fixed at request time so
+/// a 50% tier is never re-derived after a partial fill. (plan §2/§3.1)
+fn tier_fill_plan(remaining: Decimal) -> Result<Vec<Decimal>, EngineError> {
+    if remaining < Decimal::ZERO {
+        return Err(EngineError::InvalidQuantity);
+    }
+    if remaining <= Decimal::from(TIER_CHUNK) {
+        return Ok(Vec::new());
+    }
+    if remaining <= Decimal::from(1_000) {
+        return Ok(vec![remaining]);
+    }
+    if remaining <= Decimal::from(2_000) {
+        return Ok(vec![remaining / Decimal::from(2)]);
+    }
+    if remaining > tier_max_remaining() {
+        return Err(EngineError::TooManyTierFills);
+    }
+    let chunk = Decimal::from(TIER_CHUNK);
+    let mut rest = remaining;
+    let mut plan = Vec::new();
+    while rest > chunk {
+        plan.push(chunk);
+        rest -= chunk;
+    }
+    if !rest.is_zero() {
+        plan.push(rest);
+    }
+    Ok(plan)
+}
+
+/// How the engine turns accepted orders into fills. Real is the production
+/// price-crossing matcher; Tiered generates quantity-tiered synthetic fills
+/// and never runs matching. The policy is fixed for the lifetime of one
+/// Engine instance so the two price-key semantics never mix. (plan §3.3)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillPolicy {
+    Real,
+    Tiered,
+}
+
+/// Context payload for BookInvariantViolation: deliberately minimal
+/// (session/order/instrument plus the failing detail). (plan §3.5)
+fn invariant_violation(
+    session_id: &str,
+    instrument_id: i64,
+    detail: impl std::fmt::Display,
+) -> EngineError {
+    EngineError::BookInvariantViolation(format!(
+        "session={session_id} instrument={instrument_id} {detail}"
+    ))
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EngineError {
@@ -22,6 +93,13 @@ pub enum EngineError {
     InvalidPrice,
     QuantityBelowCumulated,
     UnknownSymbol(String),
+    /// Tiered only: request remaining quantity exceeds MAX_TIER_FILLS lots.
+    TooManyTierFills,
+    /// Tiered only: quotes would cross the synthetic book with real matching.
+    QuoteNotSupportedInTiered,
+    /// Book/mirror divergence detected on the serialized tiered path; the
+    /// session must be failed and closed, not business-rejected. (plan §3.5)
+    BookInvariantViolation(String),
 }
 
 impl std::fmt::Display for EngineError {
@@ -37,6 +115,17 @@ impl std::fmt::Display for EngineError {
                 write!(f, "replacement quantity is below already filled quantity")
             }
             EngineError::UnknownSymbol(s) => write!(f, "unknown symbol {}", s),
+            EngineError::TooManyTierFills => write!(
+                f,
+                "quantity exceeds the tiered fill limit ({})",
+                tier_max_remaining()
+            ),
+            EngineError::QuoteNotSupportedInTiered => {
+                write!(f, "quotes are not accepted while FillPolicy=Tiered")
+            }
+            EngineError::BookInvariantViolation(context) => {
+                write!(f, "internal book invariant violation: {context}")
+            }
         }
     }
 }
@@ -138,6 +227,7 @@ pub struct Engine {
     pending_market_data: HashMap<i64, u64>,
     stats_cache: HashMap<i64, Statistics>,
     order_dates: HashMap<(String, OrderId), NaiveDate>,
+    fill_policy: FillPolicy,
     #[cfg(test)]
     snapshot_builds: usize,
 }
@@ -157,8 +247,20 @@ impl Engine {
             pending_market_data: HashMap::new(),
             stats_cache: HashMap::new(),
             order_dates: HashMap::new(),
+            fill_policy: FillPolicy::Real,
             #[cfg(test)]
             snapshot_builds: 0,
+        }
+    }
+
+    /// Construct an engine with an explicit fill policy. The policy cannot
+    /// change afterwards: books written under Real and Tiered use different
+    /// price-level keys, so switching with resting orders would corrupt the
+    /// book. (plan §3.3)
+    pub fn with_fill_policy(policy: FillPolicy) -> Engine {
+        Engine {
+            fill_policy: policy,
+            ..Engine::new()
         }
     }
 
@@ -311,6 +413,13 @@ impl Engine {
                 return Err(EngineError::DuplicateOrderId(new.id));
             }
         }
+        // Tiered: validate the bounded fill plan before any state changes so
+        // an over-limit request is a plain business reject with no side
+        // effects. (plan §3.1)
+        let tiered_plan = match self.fill_policy {
+            FillPolicy::Real => None,
+            FillPolicy::Tiered => Some(tier_fill_plan(new.quantity)?),
+        };
         self.next_exchange_id += 1;
         self.next_arrival += 1;
         let mut order = match new.order_type {
@@ -333,6 +442,12 @@ impl Engine {
             ),
         };
         order.exchange_id = self.next_exchange_id.to_string();
+        // Tiered market orders carry their fixed fill price in the price
+        // field: it doubles as the book level key and LastPx, and keeps every
+        // removal path (which looks up by `order.price`) consistent.
+        if matches!(self.fill_policy, FillPolicy::Tiered) && order.order_type == OrderType::Market {
+            order.price = tiered_market_price();
+        }
 
         let session = self
             .sessions
@@ -342,18 +457,42 @@ impl Engine {
         self.order_dates
             .insert((session_id.to_string(), order.id), Utc::now().date_naive());
 
-        let (mut trades, final_state) = self.add_to_book(order);
-        self.record_market_data(new.instrument_id, &trades);
-        self.publish_market_data();
-        self.send_trade_reports(&mut trades);
-        if let Some(final_order) = &final_state {
-            self.sync_record(&final_order.clone());
-            // status goes out when nothing traded, OR when a market order's
-            // unfilled remainder was cancelled
-            let remainder_cancelled =
-                final_order.state == OrderState::Cancelled && new.order_type == OrderType::Market;
-            if trades.is_empty() || remainder_cancelled {
-                self.send_status(final_order.clone());
+        match self.fill_policy {
+            FillPolicy::Real => {
+                let (mut trades, final_state) = self.add_to_book(order);
+                self.record_market_data(new.instrument_id, &trades);
+                self.publish_market_data();
+                self.send_trade_reports(&mut trades);
+                if let Some(final_order) = &final_state {
+                    self.sync_record(&final_order.clone());
+                    // status goes out when nothing traded, OR when a market order's
+                    // unfilled remainder was cancelled
+                    let remainder_cancelled = final_order.state == OrderState::Cancelled
+                        && new.order_type == OrderType::Market;
+                    if trades.is_empty() || remainder_cancelled {
+                        self.send_status(final_order.clone());
+                    }
+                }
+            }
+            FillPolicy::Tiered => {
+                let plan = tiered_plan.expect("tiered plan computed above");
+                let snapshot =
+                    match self.tiered_insert(session_id, new.instrument_id, order) {
+                        Ok(snapshot) => snapshot,
+                        Err(e) => {
+                            // publish any recorded book state before failing
+                            // the session. (plan §3.3)
+                            self.record_market_data(new.instrument_id, &[]);
+                            self.publish_market_data();
+                            return Err(e);
+                        }
+                    };
+                self.send_status(snapshot.clone());
+                let result =
+                    self.tiered_fill_existing(session_id, new.instrument_id, &snapshot, &plan);
+                self.record_market_data(new.instrument_id, &[]);
+                self.publish_market_data();
+                result?;
             }
         }
         Ok(new.id)
@@ -425,6 +564,14 @@ impl Engine {
         }
         let instrument_id = entry.instrument_id;
 
+        // Tiered: validate the bounded plan for the candidate remaining
+        // quantity before removing the original order, so an over-limit
+        // replace leaves the book untouched. (plan §3.1)
+        let tiered_plan = match self.fill_policy {
+            FillPolicy::Real => None,
+            FillPolicy::Tiered => Some(tier_fill_plan(quantity - entry.cum_quantity)?),
+        };
+
         let _removed = match self.remove_from_book(
             session_id,
             orig_id,
@@ -468,6 +615,11 @@ impl Engine {
             OrderState::Booked
         };
         order.arrival = self.next_arrival;
+        // Tiered market replacements carry the fixed fill price in the price
+        // field, same as new orders. (plan §3.3)
+        if matches!(self.fill_policy, FillPolicy::Tiered) && order_type == OrderType::Market {
+            order.price = tiered_market_price();
+        }
 
         let session = self.sessions.get_mut(session_id).unwrap();
         session.orders.remove(&orig_id);
@@ -481,6 +633,24 @@ impl Engine {
             .orders
             .insert(new_id, order.clone());
 
+        // Tiered: rest the replacement before sending the Replaced event, so
+        // a book fault precedes any confirmation. The removal version is
+        // already recorded above; publish it on the error path too. (plan §3.3)
+        let tiered_snapshot = match self.fill_policy {
+            FillPolicy::Real => None,
+            FillPolicy::Tiered if !order.remaining.is_zero() => {
+                match self.tiered_insert(session_id, instrument_id, order.clone()) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(e) => {
+                        self.record_market_data(instrument_id, &[]);
+                        self.publish_market_data();
+                        return Err(e);
+                    }
+                }
+            }
+            FillPolicy::Tiered => None,
+        };
+
         self.send_status_for(order.clone(), new_id, ExecType::Replaced, Some(orig_id));
 
         // A replacement with no remaining quantity has no book entry and no
@@ -490,12 +660,28 @@ impl Engine {
             return Ok(());
         }
 
-        let (mut trades, final_state) = self.add_to_book(order);
-        self.record_market_data(instrument_id, &trades);
-        self.publish_market_data();
-        self.send_trade_reports(&mut trades);
-        if let Some(final_order) = &final_state {
-            self.sync_record(&final_order.clone());
+        match self.fill_policy {
+            FillPolicy::Real => {
+                let (mut trades, final_state) = self.add_to_book(order);
+                self.record_market_data(instrument_id, &trades);
+                self.publish_market_data();
+                self.send_trade_reports(&mut trades);
+                if let Some(final_order) = &final_state {
+                    self.sync_record(&final_order.clone());
+                }
+            }
+            FillPolicy::Tiered => {
+                let snapshot = tiered_snapshot.expect("non-zero tiered rest computed above");
+                let result = self.tiered_fill_existing(
+                    session_id,
+                    instrument_id,
+                    &snapshot,
+                    tiered_plan.as_ref().expect("tiered plan computed above"),
+                );
+                self.record_market_data(instrument_id, &[]);
+                self.publish_market_data();
+                result?;
+            }
         }
         Ok(())
     }
@@ -571,6 +757,12 @@ impl Engine {
         ask_price: Decimal,
         ask_quantity: Decimal,
     ) -> Result<(), EngineError> {
+        // Tiered quote legs would cross synthetic resting orders with the
+        // real matcher and mix the two modes; refuse before any state
+        // changes. (plan §3.7)
+        if matches!(self.fill_policy, FillPolicy::Tiered) {
+            return Err(EngineError::QuoteNotSupportedInTiered);
+        }
         if self.instruments.get_by_id(instrument_id).is_none() {
             return Err(EngineError::UnknownSymbol(instrument_id.to_string()));
         }
@@ -719,6 +911,64 @@ impl Engine {
             .entry(instrument_id)
             .or_insert_with(|| OrderBook::new(instrument_id));
         book.add(order)
+    }
+
+    /// Tiered only: rest `order` without matching and sync the session mirror
+    /// with the actual book snapshot (Booked/PartialFill per cum). The engine
+    /// serializes all access, so a book error here is invariant divergence.
+    /// (plan §3.3)
+    fn tiered_insert(
+        &mut self,
+        session_id: &str,
+        instrument_id: i64,
+        order: Order,
+    ) -> Result<Order, EngineError> {
+        let snapshot = {
+            let book = self
+                .books
+                .entry(instrument_id)
+                .or_insert_with(|| OrderBook::new(instrument_id));
+            book.insert_only(order)
+                .map_err(|e| invariant_violation(session_id, instrument_id, &e))?
+        };
+        self.sync_record(&snapshot);
+        Ok(snapshot)
+    }
+
+    /// Apply a precomputed tiered plan to an already-resting order. Only
+    /// fills: no insertion, no New/Replaced ack, no re-derivation of the tier
+    /// from the shrinking remaining quantity. (plan §3.3)
+    fn tiered_fill_existing(
+        &mut self,
+        session_id: &str,
+        instrument_id: i64,
+        order: &Order,
+        plan: &[Decimal],
+    ) -> Result<(), EngineError> {
+        for (index, chunk) in plan.iter().enumerate() {
+            let filled = {
+                let book = self.books.get_mut(&instrument_id).ok_or_else(|| {
+                    invariant_violation(
+                        session_id,
+                        instrument_id,
+                        &TieredBookError::OrderNotFound,
+                    )
+                })?;
+                book.execute(
+                    session_id,
+                    order.id,
+                    order.side,
+                    order.price,
+                    *chunk,
+                    order.price,
+                )
+                .map_err(|e| {
+                    invariant_violation(session_id, instrument_id, &format!("{e} (fill #{index})"))
+                })?
+            };
+            self.send_fill(&filled, order.price, *chunk);
+        }
+        Ok(())
     }
 
     fn remove_from_book(

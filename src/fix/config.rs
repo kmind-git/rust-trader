@@ -30,6 +30,7 @@ const KNOWN_KEYS: &[&str] = &[
     "Logging",
     "DynamicSessions",
     "TargetCompIDs",
+    "FillPolicy",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -524,6 +525,30 @@ impl FixConfig {
             }
         }
 
+        // FillPolicy is a process-global tiered-fill switch: exact values,
+        // [DEFAULT] only. A per-session occurrence is rejected even when it
+        // matches the default, so the engine never has to resolve per-session
+        // policies. Checked on the raw sections, not the resolved view, or
+        // normal DEFAULT inheritance would be rejected too. (tiered plan §3.6)
+        if let Some(value) = self.defaults.get("FillPolicy") {
+            if value != "Real" && value != "Tiered" {
+                return Err(ConfigError::Unsupported {
+                    key: "FillPolicy".to_string(),
+                    value: value.to_string(),
+                    message: "expected Real or Tiered in [DEFAULT]".to_string(),
+                });
+            }
+        }
+        for session in &self.sessions {
+            if let Some(value) = session.get("FillPolicy") {
+                return Err(ConfigError::Unsupported {
+                    key: "FillPolicy".to_string(),
+                    value: value.to_string(),
+                    message: "FillPolicy may only appear in [DEFAULT]".to_string(),
+                });
+            }
+        }
+
         // A settings file with sessions must identify each session. This
         // catches a typo before a process starts.
         let mut identities = HashSet::new();
@@ -586,6 +611,63 @@ impl Section {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_policy_accepts_exact_default_values_and_inherits() {
+        let data = "[DEFAULT]
+ConnectionType=acceptor
+BeginString=FIX.4.2
+FillPolicy=Tiered
+[SESSION]
+SenderCompID=GOX
+TargetCompID=CLIENT
+SocketAcceptPort=5001
+";
+        let cfg = FixConfig::load(data.as_bytes()).unwrap();
+        assert_eq!(cfg.defaults.get("FillPolicy"), Some("Tiered"));
+        // resolved sessions see the inherited default without a session entry
+        assert_eq!(cfg.session(0).unwrap().get("FillPolicy"), Some("Tiered"));
+    }
+
+    #[test]
+    fn fill_policy_rejects_unknown_values_case_sensitively() {
+        for bad in ["tiered", "REAL", "Sim", "Auto"] {
+            let data = format!("[DEFAULT]
+ConnectionType=acceptor
+BeginString=FIX.4.2
+FillPolicy={bad}
+[SESSION]
+SenderCompID=GOX
+TargetCompID=CLIENT
+SocketAcceptPort=5001
+");
+            match FixConfig::load(data.as_bytes()) {
+                Err(ConfigError::Unsupported { key, .. }) => assert_eq!(key, "FillPolicy"),
+                other => panic!("FillPolicy={bad} should be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fill_policy_rejects_session_scope_even_when_matching_default() {
+        let data = "[DEFAULT]
+ConnectionType=acceptor
+BeginString=FIX.4.2
+FillPolicy=Real
+[SESSION]
+SenderCompID=GOX
+TargetCompID=CLIENT
+SocketAcceptPort=5001
+FillPolicy=Real
+";
+        match FixConfig::load(data.as_bytes()) {
+            Err(ConfigError::Unsupported { key, message, .. }) => {
+                assert_eq!(key, "FillPolicy");
+                assert!(message.contains("[DEFAULT]"));
+            }
+            other => panic!("session-scoped FillPolicy should be rejected, got {other:?}"),
+        }
+    }
 
     #[test]
     fn default_values_are_inherited_and_session_values_override() {

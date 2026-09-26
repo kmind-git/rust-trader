@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::time::SystemTime;
 
 use rust_decimal::Decimal;
@@ -106,6 +107,27 @@ impl PriceLevel {
         } else {
             self.total -= quantity;
             *self.locate_mut(&order.session_id, order.id).unwrap() = order.clone();
+        }
+    }
+}
+
+/// Errors from the tiered (non-matching) book paths. These are internal
+/// invariants, not business outcomes: the engine serializes every access,
+/// so a lookup miss after successful validation means book/mirror
+/// divergence. (docs/tiered-fill-plan.md §3.2)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TieredBookError {
+    OrderNotFound,
+    DuplicateOrder,
+    InvalidExecution(String),
+}
+
+impl fmt::Display for TieredBookError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TieredBookError::OrderNotFound => write!(f, "order not found in book"),
+            TieredBookError::DuplicateOrder => write!(f, "duplicate order in price level"),
+            TieredBookError::InvalidExecution(reason) => write!(f, "invalid execution: {reason}"),
         }
     }
 }
@@ -242,6 +264,94 @@ impl OrderBook {
             });
         }
         trades
+    }
+
+    /// Tiered mode: rest an order without running matching. The level key is
+    /// the plain `price`, never the market-order sentinel
+    /// `effective_price()`: every removal path (cancel/modify/expire/
+    /// disconnect) looks orders up by the recorded `order.price`, and tiered
+    /// market orders carry their normalized fill price in that field. State is
+    /// derived from cum (Booked/PartialFill), unlike `add()` which resets to
+    /// Booked. (docs/tiered-fill-plan.md §3.2)
+    pub(crate) fn insert_only(&mut self, mut order: Order) -> Result<Order, TieredBookError> {
+        if order.remaining <= Decimal::ZERO {
+            return Err(TieredBookError::InvalidExecution(format!(
+                "resting order {} must have positive remaining, got {}",
+                order.id, order.remaining
+            )));
+        }
+        order.state = if order.cum_quantity.is_zero() {
+            OrderState::Booked
+        } else {
+            OrderState::PartialFill
+        };
+        let price = order.price;
+        let levels = match order.side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        let level = levels.entry(price).or_insert_with(|| PriceLevel::new(price));
+        if level
+            .index
+            .contains_key(&(order.session_id.clone(), order.id))
+        {
+            return Err(TieredBookError::DuplicateOrder);
+        }
+        level.push_back(order.clone());
+        Ok(order)
+    }
+
+    /// Tiered mode: apply one fixed fill to an order resting at `key_price`.
+    /// Mirrors match_trades' use of apply_fill + PriceLevel::update_fill so
+    /// `level.total` and the level index stay exact, and drops the outer
+    /// price level when its last order fills. The caller must pass the
+    /// post-fill expectation via `qty`/`fill_price`; the level copy is never
+    /// pre-mutated (update_fill's full-fill branch debits the stored
+    /// remaining). (docs/tiered-fill-plan.md §3.2)
+    pub(crate) fn execute(
+        &mut self,
+        session: &str,
+        id: OrderId,
+        side: Side,
+        key_price: Decimal,
+        qty: Decimal,
+        fill_price: Decimal,
+    ) -> Result<Order, TieredBookError> {
+        if qty <= Decimal::ZERO || fill_price <= Decimal::ZERO {
+            return Err(TieredBookError::InvalidExecution(format!(
+                "fill quantity {qty} and price {fill_price} must be positive"
+            )));
+        }
+        let levels = match side {
+            Side::Buy => &mut self.bids,
+            Side::Sell => &mut self.asks,
+        };
+        let level = levels
+            .get_mut(&key_price)
+            .ok_or(TieredBookError::OrderNotFound)?;
+        let mut order = level
+            .locate_mut(session, id)
+            .map(|resting| resting.clone())
+            .ok_or(TieredBookError::OrderNotFound)?;
+        if !order.state.is_active() {
+            return Err(TieredBookError::InvalidExecution(format!(
+                "order {id} is not active ({:?})",
+                order.state
+            )));
+        }
+        if qty > order.remaining {
+            return Err(TieredBookError::InvalidExecution(format!(
+                "fill quantity {qty} exceeds remaining {}",
+                order.remaining
+            )));
+        }
+        apply_fill(&mut order, qty, fill_price);
+        level.update_fill(&order, qty);
+        let level_empty = level.orders.is_empty();
+        if level_empty {
+            levels.remove(&key_price);
+        }
+        Ok(order)
     }
 
     fn locate_mut(

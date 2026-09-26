@@ -728,3 +728,313 @@ fn expiry_coalesces_per_instrument_without_losing_expiration_reports() {
     assert_eq!(engine.snapshot_builds - builds, 2);
     assert!(engine.pending_market_data.is_empty());
 }
+// --- tiered fill policy (docs/tiered-fill-plan.md §5.1/5.2) ---
+
+fn dec(value: &str) -> Decimal {
+    value.parse().unwrap()
+}
+
+fn tiered_engine() -> (Engine, std::sync::mpsc::Receiver<Report>) {
+    let mut engine = Engine::with_fill_policy(FillPolicy::Tiered);
+    let (tx, rx) = mpsc::channel();
+    engine.register_session("c1", tx);
+    (engine, rx)
+}
+
+fn tiered_buy(
+    engine: &mut Engine,
+    id: i32,
+    order_type: OrderType,
+    price: &str,
+    qty: &str,
+) -> Result<i32, EngineError> {
+    let instrument_id = engine.create_instrument("AAPL");
+    engine.create_order(
+        "c1",
+        NewOrder {
+            id,
+            instrument_id,
+            side: Side::Buy,
+            order_type,
+            price: dec(price),
+            quantity: dec(qty),
+        },
+    )
+}
+
+fn fills<'a>(reports: impl IntoIterator<Item = &'a Report>) -> Vec<(Decimal, Decimal, String)> {
+    reports
+        .into_iter()
+        .filter_map(|r| match r {
+            Report::Fill {
+                last_price,
+                last_quantity,
+                exec_id,
+                ..
+            } => Some((*last_price, *last_quantity, exec_id.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn tier_fill_plan_boundaries() {
+    assert_eq!(tier_fill_plan(dec("100")).unwrap(), vec![] as Vec<Decimal>);
+    assert_eq!(tier_fill_plan(dec("0")).unwrap(), vec![] as Vec<Decimal>);
+    assert!(matches!(
+        tier_fill_plan(dec("-1")),
+        Err(EngineError::InvalidQuantity)
+    ));
+    assert_eq!(tier_fill_plan(dec("100.01")).unwrap(), vec![dec("100.01")]);
+    assert_eq!(tier_fill_plan(dec("1000")).unwrap(), vec![dec("1000")]);
+    assert_eq!(tier_fill_plan(dec("1001")).unwrap(), vec![dec("500.5")]);
+    assert_eq!(tier_fill_plan(dec("2000")).unwrap(), vec![dec("1000")]);
+    assert_eq!(
+        tier_fill_plan(dec("2001")).unwrap(),
+        [vec![dec("100"); 20], vec![dec("1")]].concat()
+    );
+    assert_eq!(tier_fill_plan(dec("2500")).unwrap(), vec![dec("100"); 25]);
+    assert_eq!(
+        tier_fill_plan(dec("2550")).unwrap(),
+        [vec![dec("100"); 25], vec![dec("50")]].concat()
+    );
+    assert_eq!(tier_fill_plan(dec("25600")).unwrap(), vec![dec("100"); 256]);
+    assert!(matches!(
+        tier_fill_plan(dec("25600.01")),
+        Err(EngineError::TooManyTierFills)
+    ));
+    assert!(matches!(
+        tier_fill_plan(dec("102400")),
+        Err(EngineError::TooManyTierFills)
+    ));
+    assert!(matches!(
+        tier_fill_plan(Decimal::MAX),
+        Err(EngineError::TooManyTierFills)
+    ));
+    // full-fill tiers: plan total equals remaining
+    for remaining in ["150", "999.9", "2001", "2500", "2550", "25600"] {
+        let plan = tier_fill_plan(dec(remaining)).unwrap();
+        assert_eq!(
+            plan.iter().copied().sum::<Decimal>(),
+            dec(remaining),
+            "plan total for {remaining}"
+        );
+        assert!(plan.len() <= MAX_TIER_FILLS);
+    }
+}
+
+#[test]
+fn tiered_no_fill_up_to_100_rests_and_cancels() {
+    let (mut engine, rx) = tiered_engine();
+    tiered_buy(&mut engine, 1, OrderType::Limit, "10.5", "100").unwrap();
+
+    let reports: Vec<Report> = rx.try_iter().collect();
+    assert_eq!(reports.len(), 1, "only the New ack");
+    assert!(matches!(&reports[0], Report::Status { exec_type: ExecType::New, .. }));
+
+    let order = engine.sessions["c1"].orders.get(&1).unwrap().clone();
+    assert_eq!(order.state, OrderState::Booked);
+    let book = engine.book("AAPL").unwrap();
+    assert_eq!(book.bids.len(), 1);
+    assert_eq!(book.bids[0].price, dec("10.5"));
+    assert_eq!(book.bids[0].quantity, dec("100"));
+
+    engine.cancel_order("c1", 1).unwrap();
+    let reports: Vec<Report> = rx.try_iter().collect();
+    assert_eq!(reports.len(), 1);
+    assert!(matches!(&reports[0], Report::Status { exec_type: ExecType::Cancelled, .. }));
+    assert!(engine.book("AAPL").unwrap().bids.is_empty());
+}
+
+#[test]
+fn tiered_full_fill_between_100_and_1000() {
+    let (mut engine, rx) = tiered_engine();
+    tiered_buy(&mut engine, 1, OrderType::Limit, "10.5", "500").unwrap();
+
+    let reports: Vec<Report> = rx.try_iter().collect();
+    assert_eq!(reports.len(), 2, "New ack then one full fill");
+    let fill_prices = fills(&reports);
+    assert_eq!(fill_prices, vec![(dec("10.5"), dec("500"), "exec.2".into())]);
+    let order = engine.sessions["c1"].orders.get(&1).unwrap();
+    assert_eq!(order.state, OrderState::Filled);
+    assert_eq!(order.cum_quantity, dec("500"));
+    assert_eq!(order.avg_price, dec("10.5"));
+    assert!(engine.book("AAPL").unwrap().bids.is_empty());
+}
+
+#[test]
+fn tiered_half_fill_1000_to_2000_then_cancel() {
+    let (mut engine, rx) = tiered_engine();
+    tiered_buy(&mut engine, 1, OrderType::Limit, "10", "1500").unwrap();
+
+    let reports: Vec<Report> = rx.try_iter().collect();
+    assert_eq!(reports.len(), 2);
+    assert_eq!(fills(&reports), vec![(dec("10"), dec("750"), "exec.2".into())]);
+    let order = engine.sessions["c1"].orders.get(&1).unwrap().clone();
+    assert_eq!(order.state, OrderState::PartialFill);
+    assert_eq!(order.remaining, dec("750"));
+    // rest stays visible with the remaining quantity only
+    assert_eq!(engine.book("AAPL").unwrap().bids[0].quantity, dec("750"));
+
+    engine.cancel_order("c1", 1).unwrap();
+    let order = engine.sessions["c1"].orders.get(&1).unwrap().clone();
+    assert_eq!(order.state, OrderState::Cancelled);
+    assert_eq!(order.cum_quantity, dec("750"), "cum survives the cancel");
+    assert!(engine.book("AAPL").unwrap().bids.is_empty());
+}
+
+#[test]
+fn tiered_chunked_above_2000() {
+    let (mut engine, rx) = tiered_engine();
+    tiered_buy(&mut engine, 1, OrderType::Limit, "7", "2550").unwrap();
+
+    let reports: Vec<Report> = rx.try_iter().collect();
+    let expected: Vec<Decimal> = [vec![dec("100"); 25], vec![dec("50")]].concat();
+    let got = fills(&reports);
+    assert_eq!(got.len(), expected.len(), "every planned fill, no crossing trades");
+    assert_eq!(
+        got.iter().map(|(_, q, _)| *q).collect::<Vec<_>>(),
+        expected
+    );
+    let ids: std::collections::HashSet<&str> = got.iter().map(|(_, _, id)| id.as_str()).collect();
+    assert_eq!(ids.len(), got.len(), "ExecIDs unique");
+    assert_eq!(got[0].0, dec("7"), "fill price is the order price");
+    let order = engine.sessions["c1"].orders.get(&1).unwrap();
+    assert_eq!(order.state, OrderState::Filled);
+    assert_eq!(order.cum_quantity, dec("2550"));
+    assert!(engine.book("AAPL").unwrap().bids.is_empty());
+}
+
+#[test]
+fn tiered_market_order_fills_at_fixed_price() {
+    let (mut engine, rx) = tiered_engine();
+    tiered_buy(&mut engine, 1, OrderType::Market, "0", "500").unwrap();
+
+    let reports: Vec<Report> = rx.try_iter().collect();
+    assert_eq!(fills(&reports), vec![(dec("66.88"), dec("500"), "exec.2".into())]);
+    let order = engine.sessions["c1"].orders.get(&1).unwrap();
+    assert_eq!(order.price, dec("66.88"), "internal price normalized");
+    assert_eq!(order.order_type, OrderType::Market, "type stays Market");
+    assert_eq!(order.state, OrderState::Filled);
+}
+
+#[test]
+fn tiered_modify_plans_on_remaining_not_total() {
+    let (mut engine, rx) = tiered_engine();
+    tiered_buy(&mut engine, 1, OrderType::Limit, "10", "1500").unwrap();
+    // 750 filled, 750 remaining; replace total quantity with 1000 → R=250 →
+    // one full fill of 250, not a fresh tier on 1000.
+    engine
+        .modify_order("c1", 1, 1, dec("10"), dec("1000"))
+        .unwrap();
+
+    let reports: Vec<Report> = rx.try_iter().collect();
+    assert_eq!(reports.len(), 4, "New, Fill(750), Replaced, Fill(250)");
+    let fill_quantities: Vec<Decimal> = fills(&reports).into_iter().map(|(_, q, _)| q).collect();
+    assert_eq!(fill_quantities, vec![dec("750"), dec("250")]);
+    let order = engine.sessions["c1"].orders.get(&1).unwrap();
+    assert_eq!(order.state, OrderState::Filled);
+    assert_eq!(order.cum_quantity, dec("1000"), "never overfills");
+    assert_eq!(order.avg_price, dec("10"));
+}
+
+#[test]
+fn tiered_modify_to_zero_remaining_sends_single_replaced() {
+    let (mut engine, rx) = tiered_engine();
+    tiered_buy(&mut engine, 1, OrderType::Limit, "10", "1500").unwrap();
+    // 750 of 1500 filled; replacing the total with the cum (750) ⇒ R=0:
+    // exactly one Replaced, no re-insert, no zero-quantity fill.
+    engine.modify_order("c1", 1, 1, dec("10"), dec("750")).unwrap();
+
+    let reports: Vec<Report> = rx.try_iter().collect();
+    assert_eq!(reports.len(), 3, "New, Fill(750), Replaced");
+    assert!(matches!(
+        &reports[1],
+        Report::Fill { last_quantity, .. } if *last_quantity == dec("750")
+    ));
+    assert!(matches!(
+        &reports[2],
+        Report::Status { exec_type: ExecType::Replaced, .. }
+    ));
+    let order = engine.sessions["c1"].orders.get(&1).unwrap();
+    assert_eq!(order.state, OrderState::Filled);
+    assert!(engine.book("AAPL").unwrap().bids.is_empty());
+}
+
+#[test]
+fn tiered_over_limit_rejects_without_side_effects() {
+    let (mut engine, rx) = tiered_engine();
+    let sequence_before = engine.sequence;
+    let err = tiered_buy(&mut engine, 1, OrderType::Limit, "10", "25600.01").unwrap_err();
+    assert_eq!(err, EngineError::TooManyTierFills);
+    assert!(engine.sessions["c1"].orders.is_empty(), "no session record");
+    assert!(engine.book("AAPL").map_or(true, |b| b.bids.is_empty()));
+    assert_eq!(engine.sequence, sequence_before, "no market-data version bump");
+    assert_eq!(rx.try_iter().count(), 0, "no reports sent");
+}
+
+#[test]
+fn tiered_quote_rejected_without_side_effects() {
+    let (mut engine, rx) = tiered_engine();
+    let instrument_id = engine.create_instrument("AAPL");
+    let err = engine
+        .quote("c1", instrument_id, dec("9"), dec("10"), dec("11"), dec("10"))
+        .unwrap_err();
+    assert_eq!(err, EngineError::QuoteNotSupportedInTiered);
+    assert!(engine
+        .book("AAPL")
+        .map_or(true, |b| b.bids.is_empty() && b.asks.is_empty()));
+    assert_eq!(rx.try_iter().count(), 0);
+}
+
+#[test]
+fn tiered_crossing_orders_never_match_each_other() {
+    let (mut engine, _rx) = tiered_engine();
+    tiered_buy(&mut engine, 1, OrderType::Limit, "100", "150").unwrap();
+    let instrument_id = engine.instrument_by_symbol("AAPL").unwrap().id;
+    engine
+        .create_order(
+            "c1",
+            NewOrder {
+                id: 2,
+                instrument_id,
+                side: Side::Sell,
+                order_type: OrderType::Limit,
+                price: dec("50"),
+                quantity: dec("150"),
+            },
+        )
+        .unwrap();
+    // both filled per tier rules only: no crossing trade happened
+    let book = engine.book("AAPL").unwrap();
+    assert!(book.bids.is_empty() && book.asks.is_empty());
+    let stats = engine.statistics("AAPL").unwrap();
+    assert_eq!(stats.volume, dec("0"), "no RawTrade volume from tiered fills");
+}
+
+#[test]
+fn tiered_level_total_tracks_remaining_across_orders() {
+    let (mut engine, _rx) = tiered_engine();
+    let instrument_id = engine.create_instrument("AAPL");
+    for (id, qty) in [(1, "1500"), (2, "300")] {
+        engine
+            .create_order(
+                "c1",
+                NewOrder {
+                    id,
+                    instrument_id,
+                    side: Side::Buy,
+                    order_type: OrderType::Limit,
+                    price: dec("10"),
+                    quantity: dec(qty),
+                },
+            )
+            .unwrap();
+    }
+    // order 1 keeps 750, order 2 fully filled → level total is 750
+    let book = engine.book("AAPL").unwrap();
+    assert_eq!(book.bids[0].quantity, dec("750"));
+    // order 1 cancels cleanly afterwards
+    engine.cancel_order("c1", 1).unwrap();
+    assert!(engine.book("AAPL").unwrap().bids.is_empty());
+}
