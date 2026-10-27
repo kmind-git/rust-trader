@@ -800,8 +800,22 @@ fn rejected_execution_fields(
 
 /// blocking accept loop; spawn this on its own thread
 pub fn run_acceptor(engine: Arc<Mutex<Engine>>, cfg: AcceptorConfig) -> std::io::Result<()> {
-    validate_acceptor_config(&cfg)?;
-    let listener = TcpListener::bind(("0.0.0.0", cfg.port))?;
+    let listener = bind_acceptor(&cfg)?;
+    run_acceptor_on(engine, cfg, listener)
+}
+
+/// Validate and bind before other services are exposed or readiness published.
+pub fn bind_acceptor(cfg: &AcceptorConfig) -> std::io::Result<TcpListener> {
+    validate_acceptor_config(cfg)?;
+    TcpListener::bind(("0.0.0.0", cfg.port))
+}
+
+/// Run an already-bound listener so startup can coordinate REST/FIX readiness.
+pub fn run_acceptor_on(
+    engine: Arc<Mutex<Engine>>,
+    cfg: AcceptorConfig,
+    listener: TcpListener,
+) -> std::io::Result<()> {
     log::info!("FIX acceptor listening on port {}", cfg.port);
     let active_sessions = Arc::new(Mutex::new(HashSet::<String>::new()));
     for stream in listener.incoming() {

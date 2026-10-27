@@ -28,9 +28,9 @@ or an implementation of every conditional rule in the complete dictionary.
 
 ## 部署缺陷回归
 
-运行 `cargo build --bin exchange` 后执行 `python tests/deployment_smoke.py`。
-检查 `--server` 在 stdin EOF 下保持 REST/FIX 可用，默认交互模式 EOF 正常退出，以及 systemd 启动参数。
-还会使用工作流中的实际 tar 命令打包本地 fixture，验证生成路径与 artifact/release 匹配；这不替代 Linux musl 构建、systemd 或 GitHub Actions 实跑。测试文件保存在 `target/deployment-smoke/`。
+运行 `cargo build --locked --bins` 后执行 `python tests/startup_validation.py`，覆盖错误、空、重复品种配置启动失败，应用/FIX 日志不可写，`--check` 不监听，FIX/REST 端口冲突不发布就绪，以及从其它目录调用时的默认品种路径、stdin EOF 和 `RUST_LOG=off`。
+
+`python tests/deployment_smoke.py` 仅在 Linux 普通用户下从真实 musl 发布归档验证解压、配置修改、启停和实例隔离，具体参数见脚本帮助及 [DEPLOY.md](../DEPLOY.md)。发布工作流使用实际归档运行相同部署门禁；Windows 执行时明确跳过。Windows 本地启动回归不能替代 Linux 文件权限、systemd、SELinux 或 RHEL/CentOS 目标系统验收。生成数据保存在仓库 `target/test-runs/` 下。
 
 ## 性能与队列回归
 

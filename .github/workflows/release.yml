@@ -44,6 +44,9 @@ jobs:
         env:
           CI_RUNNER: ubuntu-24.04 (github-actions)
 
+      - name: Accept actual archive as ordinary Linux user
+        run: python3 tests/deployment_smoke.py --archive "dist/rust-trader-${{ steps.rel.outputs.id }}-linux-x86_64-musl.tar.gz"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

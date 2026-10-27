@@ -1,3 +1,4 @@
+# Generate with: ./traderctl systemd-unit (do not install this template directly)
 [Unit]
 Description=Rust Trader Exchange (FIX 4.2 acceptor + REST)
 After=network-online.target
@@ -5,12 +6,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=rusttrader
-Group=rusttrader
-WorkingDirectory=/home/rust-trader
-ExecStart=/home/rust-trader/bin/exchange --server
-Restart=always
+User=@USER@
+Group=@GROUP@
+WorkingDirectory=@ROOT@
+ExecStart="@ROOT@/traderctl" run
+Restart=on-failure
 RestartSec=3
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

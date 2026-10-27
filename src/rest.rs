@@ -153,45 +153,56 @@ pub fn start(
         let engine = engine.lock().unwrap();
         engine.market_data()
     };
+    let mut workers = Vec::new();
+    let mut gates = Vec::new();
+    for i in 0..4 {
+        let server = Arc::clone(&server);
+        let engine = Arc::clone(&engine);
+        let market_data = market_data.clone();
+        let (activate, gate) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::Builder::new()
+            .name(format!("rest-worker-{}", i))
+            .spawn(move || {
+                // A failed partial startup drops all senders so these
+                // workers exit instead of leaving a live partial API.
+                if gate.recv().is_err() {
+                    return;
+                }
+                loop {
+                    let request = match server.recv() {
+                        Ok(request) => request,
+                        Err(_) => continue,
+                    };
+                    let path = request.url().to_string();
+                    let data = request_snapshot(&market_data, &engine, &path);
+                    let (status, body) = serialize(data);
+                    let content_type = if body.starts_with('{') || body.starts_with('[') {
+                        "application/json"
+                    } else {
+                        "text/plain; charset=utf-8"
+                    };
+                    let response = tiny_http::Response::from_string(body)
+                        .with_status_code(status)
+                        .with_header(
+                            tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type)
+                                .unwrap(),
+                        );
+                    let _ = request.respond(response);
+                }
+            })?;
+        workers.push(worker);
+        gates.push(activate);
+    }
     let handle = std::thread::Builder::new()
         .name("rest".to_string())
         .spawn(move || {
-            let mut workers = Vec::new();
-            for i in 0..4 {
-                let server = Arc::clone(&server);
-                let engine = Arc::clone(&engine);
-                let market_data = market_data.clone();
-                let worker = std::thread::Builder::new()
-                    .name(format!("rest-worker-{}", i))
-                    .spawn(move || loop {
-                        let request = match server.recv() {
-                            Ok(request) => request,
-                            Err(_) => continue,
-                        };
-                        let path = request.url().to_string();
-                        let data = request_snapshot(&market_data, &engine, &path);
-                        let (status, body) = serialize(data);
-                        let content_type = if body.starts_with('{') || body.starts_with('[') {
-                            "application/json"
-                        } else {
-                            "text/plain; charset=utf-8"
-                        };
-                        let response = tiny_http::Response::from_string(body)
-                            .with_status_code(status)
-                            .with_header(
-                                tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type)
-                                    .unwrap(),
-                            );
-                        let _ = request.respond(response);
-                    })
-                    .expect("failed to spawn rest worker");
-                workers.push(worker);
-            }
             for w in workers {
                 let _ = w.join();
             }
-        })
-        .expect("failed to spawn rest thread");
+        })?;
+    for gate in gates {
+        gate.send(()).map_err(std::io::Error::other)?;
+    }
     Ok(handle)
 }
 

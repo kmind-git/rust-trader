@@ -3,15 +3,28 @@ use std::sync::{Arc, Mutex};
 use rust_trader::core::exchange::{Engine, FillPolicy, MAX_TIER_FILLS};
 use rust_trader::core::orderbook::Book;
 use rust_trader::fix::config::{ConfigError, FixConfig, SessionSettings};
-use rust_trader::fix::log::LogConfig;
-use rust_trader::fix::session::{run_acceptor, AcceptorConfig, Admission};
+use rust_trader::fix::log::{LogConfig, SessionLog};
+use rust_trader::fix::session::{bind_acceptor, run_acceptor_on, AcceptorConfig, Admission};
 use rust_trader::rest;
+use rust_trader::runtime::{self, ReadyFile, RuntimeSettings};
 
 fn main() {
-    let mut fix_path = "configs/qf_exchange_settings".to_string();
-    let mut instruments_path = "configs/instruments.txt".to_string();
-    let mut port = "8080".to_string();
+    let root = runtime::installation_root()
+        .unwrap_or_else(|e| die(&format!("unable to locate installation: {e}")));
+    let runtime_settings = RuntimeSettings::load(&root)
+        .unwrap_or_else(|e| die(&format!("invalid runtime settings: {e}")));
+    let mut fix_path = root
+        .join("configs/qf_exchange_settings")
+        .to_string_lossy()
+        .into_owned();
+    let mut instruments_path = root
+        .join("configs/instruments.txt")
+        .to_string_lossy()
+        .into_owned();
+    let mut port = runtime_settings.value("REST_PORT", "8080");
     let mut server_mode = false;
+    let mut check_only = false;
+    let mut ready_path = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -28,8 +41,15 @@ fn main() {
                 _ => die("-port requires a REST port"),
             },
             "--server" => server_mode = true,
+            "--check" => check_only = true,
+            "--ready-file" => match args.next() {
+                Some(value) if !value.is_empty() => {
+                    ready_path = Some(std::path::PathBuf::from(value))
+                }
+                _ => die("--ready-file requires a path"),
+            },
             "-h" | "--help" => {
-                println!("usage: exchange [-fix SETTINGS] [-instruments FILE] [-port REST_PORT] [--server]");
+                println!("usage: exchange [-fix SETTINGS] [-instruments FILE] [-port REST_PORT] [--server] [--check] [--ready-file PATH]");
                 return;
             }
             other => die(&format!("unknown argument {other:?}")),
@@ -41,7 +61,9 @@ fn main() {
         _ => die("-port must be an integer between 1 and 65535"),
     };
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    runtime_settings
+        .init_logging("exchange")
+        .unwrap_or_else(|e| die(&format!("unable to initialize application log: {e}")));
 
     let fix_config = match FixConfig::load_file(&fix_path) {
         Ok(config) => config,
@@ -74,9 +96,11 @@ fn main() {
     };
     let engine = Arc::new(Mutex::new(Engine::with_fill_policy(policy)));
     if let Err(e) = engine.lock().unwrap().load_instruments(&instruments_path) {
-        println!("unable to load instruments: {}", e);
+        die(&format!(
+            "unable to load instruments {instruments_path}: {e}"
+        ));
     }
-    println!(
+    log::info!(
         "fill policy: {:?}{}",
         policy,
         if matches!(policy, FillPolicy::Tiered) {
@@ -85,10 +109,13 @@ fn main() {
             String::new()
         }
     );
-    let base_log = match LogConfig::from_settings(first, "logs/exchange") {
+    let mut base_log = match LogConfig::from_settings(first, "logs/exchange") {
         Ok(log) => log,
         Err(error) => die_config(error),
     };
+    base_log.dir = runtime::resolve(&root, &base_log.dir)
+        .to_string_lossy()
+        .into_owned();
     let dynamic = match first.bool("DynamicSessions", false) {
         Ok(value) => value,
         Err(error) => die_config(error),
@@ -111,10 +138,28 @@ fn main() {
         if session_port != port {
             die("all acceptor SESSION rows must use the same SocketAcceptPort");
         }
-        let session_log = match LogConfig::from_settings(session, "logs/exchange") {
+        let mut session_log = match LogConfig::from_settings(session, "logs/exchange") {
             Ok(log) => log,
             Err(error) => die_config(error),
         };
+        session_log.dir = runtime::resolve(&root, &session_log.dir)
+            .to_string_lossy()
+            .into_owned();
+        if session_log.enabled {
+            // Preflight both daily files before exposing any service.
+            SessionLog::new(
+                &session_log.dir,
+                &begin_string,
+                &sender_comp_id,
+                session.get("TargetCompID").unwrap_or("preflight"),
+            )
+            .unwrap_or_else(|e| {
+                die(&format!(
+                    "FIX log directory {} is not writable: {e}",
+                    session_log.dir
+                ))
+            });
+        }
         if let Some(target) = session.get("TargetCompID") {
             session_logs.insert(target.to_string(), session_log.clone());
             targets.push(target.to_string());
@@ -152,17 +197,36 @@ fn main() {
         admission,
     };
 
+    if let Some(path) = &ready_path {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            runtime::check_writable_dir(parent)
+                .unwrap_or_else(|e| die(&format!("readiness directory is not writable: {e}")));
+        }
+        if path.exists() {
+            die("readiness file already exists; remove stale instance state before starting");
+        }
+    }
+    if check_only {
+        println!("configuration and log permissions OK (FIX :{port}, REST :{rest_port}); no listeners opened");
+        return;
+    }
+    let listener = bind_acceptor(&acceptor_cfg)
+        .unwrap_or_else(|e| die(&format!("unable to bind FIX listener: {e}")));
+
     // read-only REST api
     if let Err(e) = rest::start(Arc::clone(&engine), &format!("0.0.0.0:{rest_port}")) {
-        eprintln!("unable to start web server: {}", e);
-        std::process::exit(1);
+        die(&format!("unable to start web server: {e}"));
     }
-    println!("web server access available at :{rest_port}");
+    let _ready = ready_path.as_ref().map(|path| {
+        ReadyFile::create(path)
+            .unwrap_or_else(|e| die(&format!("unable to publish readiness: {e}")))
+    });
+    log::info!("ready: FIX :{port}, REST :{rest_port}");
 
     // Service mode keeps the listener on the main thread and never reads stdin.
     // The service manager owns process lifetime; this does not daemonize/fork.
     if server_mode {
-        if let Err(e) = run_acceptor(engine, acceptor_cfg) {
+        if let Err(e) = run_acceptor_on(engine, acceptor_cfg, listener) {
             die(&format!("FIX acceptor failed: {e}"));
         }
         return;
@@ -172,8 +236,8 @@ fn main() {
     {
         let engine = Arc::clone(&engine);
         std::thread::spawn(move || {
-            if let Err(e) = run_acceptor(engine, acceptor_cfg) {
-                eprintln!("FIX acceptor failed: {}", e);
+            if let Err(e) = run_acceptor_on(engine, acceptor_cfg, listener) {
+                log::error!("FIX acceptor failed: {}", e);
                 std::process::exit(1);
             }
         });
@@ -237,8 +301,7 @@ fn die_config(error: ConfigError) -> ! {
 }
 
 fn die(message: &str) -> ! {
-    eprintln!("{message}");
-    std::process::exit(1);
+    runtime::fatal(message)
 }
 
 fn format_book(symbol: &str, book: &Book) -> String {

@@ -5,6 +5,7 @@ use rust_trader::core::order::Side;
 use rust_trader::fix::config::{ConfigError, FixConfig, SessionSettings};
 use rust_trader::fix::log::LogConfig;
 use rust_trader::fix::session::{Callback, FillView, Initiator, InitiatorConfig, OrderView};
+use rust_trader::runtime::{self, RuntimeSettings};
 
 struct PrintCallback;
 
@@ -49,8 +50,14 @@ fn d(v: rust_decimal::Decimal) -> String {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let mut fix_path = "configs/qf_connector_settings".to_string();
+    let root = runtime::installation_root()
+        .unwrap_or_else(|e| die(&format!("unable to locate installation: {e}")));
+    let runtime_settings = RuntimeSettings::load(&root)
+        .unwrap_or_else(|e| die(&format!("invalid runtime settings: {e}")));
+    let mut fix_path = root
+        .join("configs/qf_connector_settings")
+        .to_string_lossy()
+        .into_owned();
     let mut sender_comp_id = "CLIENT".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -71,6 +78,9 @@ fn main() {
         }
     }
 
+    runtime_settings
+        .init_logging("client")
+        .unwrap_or_else(|e| die(&format!("unable to initialize application log: {e}")));
     let config = match FixConfig::load_file(&fix_path) {
         Ok(config) => config,
         Err(e) => die(&format!("unable to load fix settings {fix_path}: {e}")),
@@ -93,10 +103,22 @@ fn main() {
         Ok(value) => value,
         Err(e) => die_config(e),
     };
-    let log = match LogConfig::from_settings(&settings, "logs/client") {
+    let mut log = match LogConfig::from_settings(&settings, "logs/client") {
         Ok(log) => log,
         Err(e) => die_config(e),
     };
+    log.dir = runtime::resolve(&root, &log.dir)
+        .to_string_lossy()
+        .into_owned();
+    if log.enabled {
+        rust_trader::fix::log::SessionLog::new(
+            &log.dir,
+            "FIX.4.2",
+            &sender_comp_id,
+            &target_comp_id,
+        )
+        .unwrap_or_else(|e| die(&format!("unable to initialize FIX log: {e}")));
+    }
     let initiator_cfg = InitiatorConfig {
         sender_comp_id,
         target_comp_id,
@@ -205,6 +227,5 @@ fn die_config(error: ConfigError) -> ! {
 }
 
 fn die(message: &str) -> ! {
-    eprintln!("{message}");
-    std::process::exit(1);
+    runtime::fatal(message)
 }

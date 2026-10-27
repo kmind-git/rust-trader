@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Linux controller. All state belongs to this installation directory.
+set -euo pipefail
+umask 077
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+cd "$ROOT"
+for tool in flock readlink date; do
+    command -v "$tool" >/dev/null || { echo "Required Linux tool missing: $tool" >&2; exit 1; }
+done
+[[ -d /proc/self ]] || { echo 'traderctl requires Linux /proc' >&2; exit 1; }
+EXE="$ROOT/bin/exchange"
+PIDFILE="$ROOT/run/exchange.pid"
+READY="$ROOT/run/exchange.ready"
+declare -A INHERITED_ENV=()
+for key in REST_PORT RUST_LOG APP_LOG_PATH APP_LOG_RETENTION_DAYS FIX_LOG_RETENTION_DAYS START_TIMEOUT STOP_TIMEOUT; do
+    if [[ -v "$key" ]]; then INHERITED_ENV["$key"]="${!key}"; fi
+done
+REST_PORT=8080
+RUST_LOG=info
+APP_LOG_PATH=logs/app
+APP_LOG_RETENTION_DAYS=14
+FIX_LOG_RETENTION_DAYS=14
+START_TIMEOUT=15
+STOP_TIMEOUT=15
+ACTION="${1:-}"
+die() { echo "$*" >&2; exit 1; }
+
+# Do not source executable shell text from a deployment configuration.
+case "$ACTION" in start|check|restart|run)
+[[ -r configs/runtime.env ]] || die 'Cannot read configs/runtime.env'
+while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    [[ "$line" == *=* ]] || die "Invalid runtime.env entry: $line"
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+        REST_PORT|RUST_LOG|APP_LOG_PATH|APP_LOG_RETENTION_DAYS|FIX_LOG_RETENTION_DAYS|START_TIMEOUT|STOP_TIMEOUT)
+            printf -v "$key" '%s' "$value" ;;
+        *) die "Unknown runtime.env key: $key" ;;
+    esac
+done < configs/runtime.env
+;;
+stop)
+    # A broken edited configuration must not prevent stopping an existing PID.
+    if [[ -r configs/runtime.env ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^STOP_TIMEOUT=([0-9]{1,8})$ ]] && (( 10#${BASH_REMATCH[1]} > 0 )); then
+                STOP_TIMEOUT="${BASH_REMATCH[1]}"
+            fi
+        done < configs/runtime.env
+    fi ;;
+esac
+case "$ACTION" in
+    start|check|restart|run)
+        for key in "${!INHERITED_ENV[@]}"; do printf -v "$key" '%s' "${INHERITED_ENV[$key]}"; done ;;
+    stop)
+        if [[ -v INHERITED_ENV[STOP_TIMEOUT] && "${INHERITED_ENV[STOP_TIMEOUT]}" =~ ^[0-9]{1,8}$ ]] && (( 10#${INHERITED_ENV[STOP_TIMEOUT]} > 0 )); then
+            STOP_TIMEOUT="${INHERITED_ENV[STOP_TIMEOUT]}"
+        fi ;;
+esac
+for key in REST_PORT APP_LOG_RETENTION_DAYS FIX_LOG_RETENTION_DAYS START_TIMEOUT STOP_TIMEOUT; do
+    value="${!key}"
+    [[ "$value" =~ ^[0-9]+$ && ${#value} -le 8 ]] || die "$key must be an unsigned integer"
+done
+REST_PORT=$((10#$REST_PORT))
+START_TIMEOUT=$((10#$START_TIMEOUT))
+STOP_TIMEOUT=$((10#$STOP_TIMEOUT))
+(( REST_PORT > 0 && REST_PORT < 65536 && START_TIMEOUT > 0 && STOP_TIMEOUT > 0 )) || die 'Invalid port or timeout'
+[[ -n "$APP_LOG_PATH" ]] || die 'APP_LOG_PATH cannot be empty'
+export RUST_LOG APP_LOG_PATH APP_LOG_RETENTION_DAYS FIX_LOG_RETENTION_DAYS REST_PORT
+ARGS=(-fix "$ROOT/configs/qf_exchange_settings" -instruments "$ROOT/configs/instruments.txt" -port "$REST_PORT")
+
+proc_start() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
+load_pid() {
+    process_id= process_start=
+    [[ -f "$PIDFILE" && ! -L "$PIDFILE" ]] || return 1
+    read -r process_id process_start < "$PIDFILE" || return 1
+    [[ "$process_id" =~ ^[0-9]+$ && "$process_start" =~ ^[0-9]+$ ]] || return 1
+    (( process_id > 1 )) || return 1
+}
+is_instance() {
+    [[ "$(proc_start "$process_id")" == "$process_start" ]] &&
+        [[ "$(readlink -f "/proc/$process_id/exe" 2>/dev/null)" == "$EXE" ]]
+}
+is_ready() { [[ -f "$READY" && "$(cat "$READY")" == "$process_id" ]] && is_instance; }
+prepare() {
+    [[ -x "$EXE" ]] || die "Executable missing: $EXE"
+    mkdir -p "$ROOT/run" "$APP_LOG_PATH"
+    [[ ! -L "$ROOT/run" ]] || die 'run must be a private directory, not a symlink'
+    [[ -w "$ROOT/run" && -w "$APP_LOG_PATH" ]] || die 'run or app log directory is not writable'
+}
+control_lock() { exec 8> "$ROOT/run/control.lock"; flock -w "$START_TIMEOUT" 8 || die 'Another control operation is active'; }
+instance_lock() {
+    exec 9> "$ROOT/run/instance.lock"
+    flock -n 9 || die 'This installation is already running (instance lock held)'
+}
+clear_stale() {
+    if load_pid && is_instance; then die "Already running: PID $process_id"; fi
+    # A different or reused PID is never signalled. The instance lock ensures
+    # a previously managed exchange no longer owns this installation.
+    rm -f -- "$PIDFILE" "$READY"
+}
+record_pid() {
+    process_id="$1"
+    process_start="$(proc_start "$process_id")"
+    [[ -n "$process_start" ]] || die 'Process exited before PID could be recorded'
+    printf '%s %s\n' "$process_id" "$process_start" > "$PIDFILE"
+}
+start() {
+    prepare
+    control_lock
+    instance_lock
+    clear_stale
+    "$EXE" "${ARGS[@]}" --check
+    local console="$APP_LOG_PATH/console-$(date +%F).log"
+    if (( 10#$APP_LOG_RETENTION_DAYS > 0 )); then
+        local cutoff candidate stamp
+        cutoff="$(date -d "$(date +%F) -$APP_LOG_RETENTION_DAYS days" +%F)"
+        for candidate in "$APP_LOG_PATH"/console-????-??-??.log; do
+            [[ -f "$candidate" && ! -L "$candidate" ]] || continue
+            stamp="${candidate##*/console-}"; stamp="${stamp%.log}"
+            if [[ "$stamp" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && ( "$stamp" < "$cutoff" || "$stamp" == "$cutoff" ) ]]; then
+                rm -f -- "$candidate"
+            fi
+        done
+    fi
+    ( exec 8>&-; exec nohup "$EXE" "${ARGS[@]}" --server --ready-file "$READY" </dev/null >>"$console" 2>&1 ) &
+    record_pid "$!"
+    local deadline=$((SECONDS + START_TIMEOUT))
+    while ! is_ready; do
+        if ! kill -0 "$process_id" 2>/dev/null; then
+            wait "$process_id" 2>/dev/null || true
+            rm -f -- "$PIDFILE" "$READY"
+            die "Startup failed; see $console and $APP_LOG_PATH"
+        fi
+        if (( SECONDS >= deadline )); then
+            if is_instance; then kill -TERM "$process_id"; fi
+            die "Startup timed out; inspect $console and run traderctl status/stop"
+        fi
+        sleep 0.1
+    done
+    echo "Running: PID $process_id; REST port $REST_PORT"
+}
+stop() {
+    mkdir -p "$ROOT/run"
+    [[ ! -L "$ROOT/run" ]] || die 'run must be a private directory, not a symlink'
+    control_lock
+    if ! load_pid || ! is_instance; then
+        echo 'Stopped (missing, stale, or unrelated PID; no signal sent)'
+        return 0
+    fi
+    kill -TERM "$process_id"
+    local deadline=$((SECONDS + STOP_TIMEOUT))
+    while is_instance; do
+        (( SECONDS < deadline )) || die "Stop timed out for PID $process_id; no forced kill sent"
+        sleep 0.1
+    done
+    rm -f -- "$PIDFILE" "$READY"
+    echo 'Stopped'
+}
+case "$ACTION" in
+    check) prepare; "$EXE" "${ARGS[@]}" --check ;;
+    start) start ;;
+    stop) stop ;;
+    restart) stop; exec 8>&-; start ;;
+    status)
+        if load_pid && is_instance; then
+            if is_ready; then echo "Running: PID $process_id (ready)"; else echo "Running: PID $process_id (not ready)"; exit 1; fi
+        else
+            echo 'Stopped (missing, stale, or unrelated PID)'; exit 3
+        fi ;;
+    run)
+        prepare; control_lock; instance_lock; clear_stale
+        "$EXE" "${ARGS[@]}" --check
+        record_pid "$$"
+        exec 8>&-
+        exec "$EXE" "${ARGS[@]}" --server --ready-file "$READY" ;;
+    systemd-unit)
+        # Reject roots requiring more systemd escaping than the template supports.
+        [[ "$ROOT" != *$'\n'* && "$ROOT" != *'%'* && "$ROOT" != *'$'* && "$ROOT" != *'`'* && "$ROOT" != *'"'* && "$ROOT" != *'\'* ]] || die 'Path cannot be represented by this systemd template'
+        runtime_user="$(id -un)"; runtime_group="$(id -gn)"
+        [[ "$runtime_user" != root ]] || die 'Generate the unit as the intended deployment user'
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            case "$line" in
+                'User=@USER@') printf 'User=%s\n' "$runtime_user" ;;
+                'Group=@GROUP@') printf 'Group=%s\n' "$runtime_group" ;;
+                'WorkingDirectory=@ROOT@') printf 'WorkingDirectory=%s\n' "$ROOT" ;;
+                'ExecStart="@ROOT@/traderctl" run') printf 'ExecStart="%s/traderctl" run\n' "$ROOT" ;;
+                *) printf '%s\n' "$line" ;;
+            esac
+        done < "$ROOT/systemd/rust-trader.service.in" ;;
+    *) echo 'Usage: traderctl {check|start|stop|restart|status|run|systemd-unit}' >&2; exit 2 ;;
+esac

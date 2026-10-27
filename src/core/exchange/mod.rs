@@ -265,9 +265,8 @@ impl Engine {
     }
 
     pub fn load_instruments(&mut self, path: &str) -> std::io::Result<()> {
-        let result = self.instruments.load(path);
-        // A read error may leave successfully parsed instruments in the map.
-        // Publish the same registry the Engine exposes, including that case.
+        self.instruments.load(path)?;
+        // The registry is loaded atomically; publish only validated instruments.
         let symbols = self.instruments.all_symbols();
         let instruments = &self.instruments;
         self.market_data.register(
@@ -275,7 +274,7 @@ impl Engine {
                 .iter()
                 .filter_map(|symbol| instruments.get_by_symbol(symbol)),
         );
-        result
+        Ok(())
     }
 
     // --- sessions ---
@@ -476,17 +475,16 @@ impl Engine {
             }
             FillPolicy::Tiered => {
                 let plan = tiered_plan.expect("tiered plan computed above");
-                let snapshot =
-                    match self.tiered_insert(session_id, new.instrument_id, order) {
-                        Ok(snapshot) => snapshot,
-                        Err(e) => {
-                            // publish any recorded book state before failing
-                            // the session. (plan §3.3)
-                            self.record_market_data(new.instrument_id, &[]);
-                            self.publish_market_data();
-                            return Err(e);
-                        }
-                    };
+                let snapshot = match self.tiered_insert(session_id, new.instrument_id, order) {
+                    Ok(snapshot) => snapshot,
+                    Err(e) => {
+                        // publish any recorded book state before failing
+                        // the session. (plan §3.3)
+                        self.record_market_data(new.instrument_id, &[]);
+                        self.publish_market_data();
+                        return Err(e);
+                    }
+                };
                 self.send_status(snapshot.clone());
                 let result =
                     self.tiered_fill_existing(session_id, new.instrument_id, &snapshot, &plan);
@@ -948,11 +946,7 @@ impl Engine {
         for (index, chunk) in plan.iter().enumerate() {
             let filled = {
                 let book = self.books.get_mut(&instrument_id).ok_or_else(|| {
-                    invariant_violation(
-                        session_id,
-                        instrument_id,
-                        &TieredBookError::OrderNotFound,
-                    )
+                    invariant_violation(session_id, instrument_id, &TieredBookError::OrderNotFound)
                 })?;
                 book.execute(
                     session_id,

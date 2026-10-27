@@ -82,10 +82,12 @@ TargetCompID=CLIENT
         proc = subprocess.Popen(
             [str(EXE), "-fix", str(cfg), "-instruments", "configs/instruments.txt", "-port", str(rest_port)],
             cwd=ROOT, stdin=subprocess.PIPE, stdout=log, stderr=log, text=True,
+            env=dict(os.environ, APP_LOG_PATH=str(OUT / "app"), RUST_LOG="info"),
         )
         try:
             wait_for_rest(rest_port, OUT / "exchange.log")
-            startup = (OUT / "exchange.log").read_text(encoding="utf-8", errors="replace")
+            startup = "".join(path.read_text(encoding="utf-8", errors="replace")
+                              for path in (OUT / "app").glob("exchange-*.log"))
             assert "fill policy: Real" in startup, "default policy must be Real"
             run_matrix(fix_port, rest_port)
             print("PASS: real crossing semantics, sweeps, market remainder, replace, rejects, quotes, stats")

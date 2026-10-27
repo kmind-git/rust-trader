@@ -89,13 +89,13 @@ def wire(kind, seq, sender, fields=(), target="GOX"):
     return data + f"10={sum(data) % 256:03}".encode() + SOH
 
 class Peer:
-    def __init__(self, port, sender):
+    def __init__(self, port, sender, extensions=()):
         self.sender, self.seq, self.buffer = sender, 0, b""
         self.remote = "GOX"
         self.socket = socket.create_connection(("127.0.0.1", port), timeout=5)
         self.socket.settimeout(5)
         self.exec_ids = set()
-        self.send("A", [(98, "0"), (108, "30")])
+        self.send("A", [(98, "0"), (108, "30"), *extensions])
         self.until(lambda m: m[35] == "A")
 
     def send(self, kind, fields=()):
@@ -127,11 +127,12 @@ class Peer:
                 return msg
         raise AssertionError("expected message never arrived")
 
-    def order(self, ident, side, qty, price=None):
+    def order(self, ident, side, qty, price=None, extensions=()):
         f = [(11, ident), (21, "1"), (55, "AAPL"), (54, side), (60, timestamp()),
              (40, "1" if price is None else "2"), (38, qty)]
         if price is not None:
             f.append((44, price))
+        f.extend(extensions)
         self.send("D", f)
         return self.until(lambda m: m[35] == "8" and m.get(11) == ident)
 
@@ -184,9 +185,10 @@ Logging=N
             peer.sender, peer.remote, peer.seq = "GOX", ident, 0
             peer.socket, peer.buffer, peer.exec_ids = conn, b"", set()
             assert peer.receive()[35] == "A"
-            peer.send("A", [(98, "0"), (108, "30")])
+            peer.send("A", [(98, "0"), (108, "30"), (9001, "initiator-logon")])
             peer.send("d", [(320, "bootstrap"), (322, "1"), (323, "4"),
-                            (393, "1"), (55, "AAPL"), (48, "2"), (22, "8")])
+                            (393, "1"), (55, "AAPL"), (48, "2"), (22, "8"),
+                            (15, "USD"), (9001, "initiator-security")])
             if binary == "client":
                 proc.stdin.write("buy AAPL 10 100\n")
                 proc.stdin.flush()
@@ -195,7 +197,8 @@ Logging=N
                 # Ack to give the client a standard active order record.
                 peer.send("8", [(37, "ex1"), (17, "ack1"), (20, "0"), (150, "0"), (39, "0"),
                                 (11, order[11]), (55, "AAPL"), (54, "1"), (38, "10"),
-                                (40, "2"), (44, "100"), (151, "10"), (14, "0"), (6, "0")])
+                                (40, "2"), (44, "100"), (151, "10"), (14, "0"), (6, "0"),
+                                (1, "ignored-account"), (9001, "initiator-report")])
                 proc.stdin.write("buy AAPL 2\n")
                 proc.stdin.flush()
                 market = peer.until(lambda m: m[35] == "D")
@@ -258,8 +261,10 @@ TargetCompID=TAKER
                 except OSError:
                     assert time.monotonic() < deadline, "exchange startup timed out"
                     time.sleep(.05)
-            maker, taker = Peer(port, "MAKER"), Peer(port, "TAKER")
-            r = maker.order("ask-alpha", "2", "4", "100")
+            maker = Peer(port, "MAKER", [(383, "8192"), (9001, "compatible-logon")])
+            taker = Peer(port, "TAKER", [(9002, "compatible-logon")])
+            r = maker.order("ask-alpha", "2", "4", "100",
+                            [(1, "ignored-account"), (9001, "compatible-new"), (9002, "extra")])
             assert r[150] == "0" and Decimal(r[6]) == 0
             r = taker.order("buy-alpha", "1", "10", "100")
             if r[150] == "0":
@@ -267,13 +272,15 @@ TargetCompID=TAKER
             assert Decimal(r[14]) == 4 and Decimal(r[151]) == 6 and Decimal(r[6]) == 100
             order_id = r[37]
             taker.send("G", [(41, "buy-alpha"), (11, "buy-beta"), (21, "1"), (55, "AAPL"),
-                             (54, "1"), (60, timestamp()), (40, "2"), (38, "10"), (44, "100")])
+                             (54, "1"), (60, timestamp()), (40, "2"), (38, "10"), (44, "100"),
+                             (1, "ignored-account"), (9001, "compatible-replace")])
             r = taker.until(lambda m: m[35] == "8" and m.get(150) == "5")
             assert r[11] == "buy-beta" and r[41] == "buy-alpha"
             assert r[37] == order_id and r[39] == "1"
             assert Decimal(r[14]) == 4 and Decimal(r[151]) == 6 and Decimal(r[6]) == 100
             taker.send("F", [(41, "buy-beta"), (11, "cancel-beta"), (55, "AAPL"),
-                             (54, "1"), (60, timestamp()), (38, "10")])
+                             (54, "1"), (60, timestamp()), (38, "10"),
+                             (1, "ignored-account"), (9001, "compatible-cancel")])
             r = taker.until(lambda m: m[35] == "8" and m.get(150) == "4")
             assert r[11] == "cancel-beta" and r[41] == "buy-beta"
             assert Decimal(r[14]) == 4 and Decimal(r[151]) == 0
@@ -285,14 +292,32 @@ TargetCompID=TAKER
                              (54, "1"), (60, timestamp()), (38, "10")])
             r = taker.until(lambda m: m[35] == "9")
             assert r[37] == order_id and r[39] == "4"
+            # Extensions must not bypass the existing semantic or structural
+            # checks, and rejects must leave the logged-on session usable.
+            valid_order = [(11, "invalid-compatible"), (21, "1"), (55, "AAPL"),
+                           (54, "1"), (60, timestamp()), (40, "2"), (38, "1"),
+                           (44, "1"), (9001, "extension")]
+            invalid_orders = [
+                [(t, v) for t, v in valid_order if t != 11],
+                [(t, "3" if t == 40 else v) for t, v in valid_order],
+                [*valid_order, (59, "4")],
+                [*valid_order, (9001, "duplicate")],
+                [*valid_order, (78, "1"), (79, "unknown-group"), (80, "1")],
+                [*valid_order, (95, "4"), (96, "data")],
+            ]
+            for fields in invalid_orders:
+                taker.send("D", fields)
+                response = taker.until(lambda m: m[35] in ("3", "8"))
+                assert response[35] == "3", response
             maker.order("ask-market", "2", "2", "101")
             r = taker.order("market-alpha", "1", "2")
             if r[150] == "0":
                 r = taker.until(lambda m: m[35] == "8" and m.get(11) == "market-alpha" and m[150] == "2")
             assert r[150] == "2" and Decimal(r[6]) == 101
-            maker.send("i", [(117, "quote-standard"), (301, "2"), (296, "1"),
-                             (302, "set-1"), (311, "IBM"), (304, "1"), (295, "1"),
-                             (299, "entry-1"), (55, "IBM"), (132, "99"), (133, "101"),
+            maker.send("i", [(117, "quote-standard"), (301, "2"), (9001, "quote-root"), (296, "1"),
+                             (302, "set-1"), (311, "IBM"), (9002, "quote-set"), (304, "1"), (295, "1"),
+                             (299, "entry-1"), (55, "IBM"), (65, "ignored-suffix"),
+                             (9003, "quote-entry"), (132, "99"), (133, "101"),
                              (134, "10"), (135, "10")])
             r = maker.until(lambda m: m[35] == "b")
             assert r[117] == "quote-standard" and r[297] == "0"
@@ -311,13 +336,19 @@ TargetCompID=TAKER
             taker.socket.sendall(wire("4", missing, taker.sender,
                                      [(43, "Y"), (122, timestamp()), (123, "Y"), (36, str(missing + 1))]))
             taker.until(lambda m: m[35] == "0" and m.get(112) == "queued-probe")
-            taker.send("1", [(112, "probe-unique")])
+            taker.send("1", [(112, "probe-unique"), (9001, "compatible-session")])
             r = taker.until(lambda m: m[35] == "0" and m.get(112) == "probe-unique")
             maker.close()
             taker.close()
-            assert list(session_log.glob("*MAKER.messages.current.log"))
-            assert not list(session_log.glob("*TAKER*"))
-            print("PASS: dictionary-valid reports; string IDs; standard market/limit; partial fill; replace chain; cancel/reject; unique ExecID; GapFill/recovery; TestRequest; Logout")
+            message_logs = list(session_log.rglob("*MAKER.messages.log"))
+            assert message_logs
+            assert not list(session_log.rglob("*TAKER*"))
+            raw_log = b"".join(path.read_bytes() for path in message_logs)
+            for original_field in [b"9001=compatible-logon", b"1=ignored-account",
+                                   b"9001=compatible-new", b"9002=extra",
+                                   b"9001=quote-root", b"9002=quote-set", b"9003=quote-entry"]:
+                assert original_field + SOH in raw_log, original_field
+            print("PASS: dictionary-valid reports; default scalar compatibility; raw extension logs; invalid order/group/data rejection; string IDs; market/limit; partial fill; replace/cancel; unique ExecID; GapFill/recovery; TestRequest; Logout")
         finally:
             if proc.poll() is None:
                 try:

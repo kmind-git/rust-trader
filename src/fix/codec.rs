@@ -389,7 +389,7 @@ pub fn build_mass_quote_ack(quote_id: &str) -> Vec<(u32, String)> {
     ]
 }
 
-// ---- decode: strict supported FIX 4.2 profile ----
+// ---- decode: supported FIX 4.2 semantics with scalar field compatibility ----
 
 #[derive(Debug)]
 pub enum Inbound {
@@ -496,50 +496,182 @@ fn validate_timestamp(value: &str) -> Result<(), String> {
     .map_err(|_| "invalid UTCTimestamp".into())
 }
 
+// Scalar membership/order follows the bundled QuickFIX FIX42.xml fixture.
+// This metadata identifies field boundaries and scope; it does not implement
+// account, routing, settlement or other semantics for ignored optional fields.
+fn scalar_fields(kind: &str) -> &'static [u32] {
+    match kind {
+        "A" => &[98, 108, 141, 383],
+        "0" | "1" => &[112],
+        "2" => &[7, 16],
+        "3" => &[45, 371, 372, 373, 58],
+        "4" => &[123, 36],
+        "5" => &[58],
+        "D" => &[
+            11, 109, 76, 1, 63, 64, 21, 18, 110, 111, 100, 81, 55, 65, 48, 22, 167, 200, 205, 201,
+            202, 206, 231, 223, 207, 106, 107, 140, 54, 114, 60, 38, 152, 40, 44, 99, 15, 376, 377,
+            23, 117, 59, 168, 432, 126, 427, 12, 13, 47, 121, 120, 58, 193, 192, 77, 203, 204, 210,
+            211, 388, 389, 439, 440,
+        ],
+        "F" => &[
+            41, 37, 11, 66, 1, 109, 76, 55, 65, 48, 22, 167, 200, 205, 201, 202, 206, 231, 223,
+            207, 106, 107, 54, 60, 38, 152, 376, 377, 58,
+        ],
+        "G" => &[
+            37, 109, 76, 41, 11, 66, 1, 63, 64, 21, 18, 110, 111, 100, 55, 65, 48, 22, 167, 200,
+            205, 201, 202, 206, 231, 223, 207, 106, 107, 54, 60, 38, 152, 40, 44, 99, 211, 388,
+            389, 376, 377, 15, 59, 168, 432, 126, 427, 12, 13, 47, 121, 120, 58, 193, 192, 77, 203,
+            204, 210, 114, 439, 440,
+        ],
+        "8" => &[
+            37, 198, 11, 41, 109, 76, 66, 17, 20, 19, 150, 39, 103, 378, 1, 63, 64, 55, 65, 48, 22,
+            167, 200, 205, 201, 202, 206, 231, 223, 207, 106, 107, 54, 38, 152, 40, 44, 99, 211,
+            388, 389, 15, 376, 377, 59, 168, 432, 126, 18, 47, 32, 31, 194, 195, 30, 336, 29, 151,
+            14, 6, 424, 425, 426, 427, 75, 60, 113, 12, 13, 381, 119, 120, 155, 156, 21, 110, 111,
+            77, 210, 58, 193, 192, 439, 440, 442,
+        ],
+        "9" => &[37, 198, 11, 41, 39, 109, 76, 66, 1, 60, 434, 102, 58],
+        "i" => &[131, 117, 301, 293, 294],
+        "b" => &[131, 117, 297, 300, 301, 336, 58],
+        "d" => &[
+            320, 322, 323, 393, 55, 65, 48, 22, 167, 200, 205, 201, 202, 206, 231, 223, 207, 106,
+            107, 15, 336, 58,
+        ],
+        "j" => &[45, 372, 379, 380, 58],
+        _ => &[],
+    }
+}
+
+const HEADER_FIELDS: &[u32] = &[
+    35, 49, 56, 115, 128, 34, 50, 142, 57, 143, 116, 144, 129, 145, 43, 97, 52, 122, 347, 369, 370,
+];
+const QUOTE_SET_FIELDS: &[u32] = &[
+    302, 311, 312, 309, 305, 310, 313, 314, 315, 316, 317, 436, 435, 308, 306, 307, 367, 304, 295,
+];
+const QUOTE_ENTRY_FIELDS: &[u32] = &[
+    299, 55, 65, 48, 22, 167, 200, 205, 201, 202, 206, 231, 223, 207, 106, 107, 132, 133, 134, 135,
+    62, 188, 190, 189, 191, 60, 336, 64, 40, 193, 192, 15,
+];
+
+fn validate_field_shape(tag: u32, kind: &str) -> Result<(), String> {
+    if matches!(
+        tag,
+        89 | 90 | 91 | 93 | 95 | 96 | 212 | 213 | 348..=365 | 445 | 446
+    ) {
+        return Err(format!(
+            "unsupported length/data field {tag}: cannot safely skip encoded data"
+        ));
+    }
+    if matches!(
+        tag,
+        33 | 73
+            | 78
+            | 124
+            | 136
+            | 146
+            | 199
+            | 215
+            | 267
+            | 268
+            | 295
+            | 296
+            | 382
+            | 384
+            | 386
+            | 398
+            | 420
+            | 428
+    ) && !(kind == "i" && matches!(tag, 295 | 296))
+    {
+        return Err(format!(
+            "unsupported repeating group {tag}: group dictionary is not implemented"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_field_scopes(message: &super::frame::FixMessage, kind: &str) -> Result<(), String> {
+    let mut body_started = false;
+    // The current MassQuote contract has exactly one set and one entry. Walk
+    // original fields in place so extensions cannot move a field across scopes.
+    let mut quote_scope = 0;
+    let mut previous = None;
+    let mut needs_delimiter = false;
+    for (tag, _) in &message.fields {
+        validate_field_shape(*tag, kind)?;
+        if HEADER_FIELDS.contains(tag) {
+            if body_started {
+                return Err(format!("header tag {tag} after message body"));
+            }
+            continue;
+        }
+        body_started = true;
+        if kind == "i" && *tag == 296 {
+            quote_scope = 1;
+            previous = None;
+            needs_delimiter = true;
+            continue;
+        }
+        let scope = match quote_scope {
+            1 => QUOTE_SET_FIELDS,
+            2 => QUOTE_ENTRY_FIELDS,
+            _ => scalar_fields(kind),
+        };
+        if needs_delimiter && Some(tag) != scope.first() {
+            return Err(format!("missing MassQuote group delimiter {}", scope[0]));
+        }
+        needs_delimiter = false;
+        // User-defined tags are single-value extensions by contract. No
+        // custom repeating groups or length/data encoding is inferred from
+        // their values; repeated custom tags are rejected by validate_profile.
+        if *tag >= 5000 {
+            continue;
+        }
+        let position = scope.iter().position(|known| known == tag).ok_or_else(|| {
+            format!("unsupported tag {tag} in message {kind} scope {quote_scope}")
+        })?;
+        if quote_scope != 0 {
+            if previous.is_some_and(|prev| position <= prev) {
+                return Err("MassQuote group fields out of order".into());
+            }
+            previous = Some(position);
+        }
+        if kind == "i" && *tag == 295 {
+            quote_scope = 2;
+            previous = None;
+            needs_delimiter = true;
+        }
+    }
+    if needs_delimiter {
+        return Err("missing MassQuote group delimiter".into());
+    }
+    Ok(())
+}
+
 fn validate_profile(message: &super::frame::FixMessage, kind: &str) -> Result<(), String> {
-    let (required, allowed): (&[u32], &[u32]) = match kind {
-        "A" => (&[98, 108], &[98, 108, 141]),
-        "0" => (&[], &[112]),
-        "1" => (&[112], &[112]),
-        "2" => (&[7, 16], &[7, 16]),
-        "3" => (&[45], &[45, 371, 372, 373, 58]),
-        "4" => (&[36], &[36, 123]),
-        "5" => (&[], &[58]),
-        "D" => (
-            &[11, 21, 55, 54, 60, 40, 38],
-            &[11, 21, 55, 54, 60, 40, 38, 44, 59],
-        ),
-        "F" => (&[11, 41, 55, 54, 60], &[11, 41, 55, 54, 60, 38]),
-        "G" => (
-            &[11, 41, 21, 55, 54, 60, 40, 38],
-            &[11, 41, 21, 55, 54, 60, 40, 38, 44, 59],
-        ),
-        "8" => (
-            &[37, 17, 20, 150, 39, 55, 54, 151, 14, 6],
-            &[
-                37, 17, 20, 150, 39, 55, 54, 151, 14, 6, 11, 41, 38, 40, 44, 31, 32, 60, 103, 58,
-            ],
-        ),
-        "9" => (&[37, 11, 41, 39, 434], &[37, 11, 41, 39, 434, 102, 58, 60]),
-        "i" => (
-            &[117, 296, 302, 311, 304, 295, 299, 55],
-            &[
-                117, 301, 296, 302, 311, 304, 295, 299, 55, 132, 133, 134, 135,
-            ],
-        ),
-        "b" => (&[297], &[117, 297, 300, 58]),
-        "d" => (&[320, 322, 323, 393], &[320, 322, 323, 393, 55, 48, 22]),
-        "j" => (&[372, 380], &[45, 372, 379, 380, 58]),
+    let required: &[u32] = match kind {
+        "A" => &[98, 108],
+        "0" | "5" => &[],
+        "1" => &[112],
+        "2" => &[7, 16],
+        "3" => &[45],
+        "4" => &[36],
+        "D" => &[11, 21, 55, 54, 60, 40, 38],
+        "F" => &[11, 41, 55, 54, 60],
+        "G" => &[11, 41, 21, 55, 54, 60, 40, 38],
+        "8" => &[37, 17, 20, 150, 39, 55, 54, 151, 14, 6],
+        "9" => &[37, 11, 41, 39, 434],
+        "i" => &[117, 296, 302, 311, 304, 295, 299, 55],
+        "b" => &[297],
+        "d" => &[320, 322, 323, 393],
+        "j" => &[372, 380],
         _ => return Ok(()),
     };
-    let header = [35, 34, 49, 56, 52, 43, 122];
+    validate_field_scopes(message, kind)?;
     let mut seen = std::collections::HashSet::new();
     for (tag, value) in &message.fields {
         if !seen.insert(*tag) {
             return Err(format!("duplicate tag {tag}"));
-        }
-        if !header.contains(tag) && !allowed.contains(tag) {
-            return Err(format!("unsupported tag {tag} for message {kind}"));
         }
         if value.is_empty() {
             return Err(format!("empty tag {tag}"));
@@ -720,20 +852,8 @@ pub fn decode(message: &super::frame::FixMessage) -> Result<Inbound, String> {
             if need(296)? != "1" || need(295)? != "1" || need(304)? != "1" {
                 return Err("only a single complete quote set and entry is supported".into());
             }
-            // FIX repeating groups must preserve the dictionary field order.
-            let order = [302, 311, 304, 295, 299, 55, 132, 133, 134, 135];
-            let mut previous = None;
-            let start = message.fields.iter().position(|(t, _)| *t == 296).unwrap();
-            for (tag, _) in &message.fields[start + 1..] {
-                let pos = order
-                    .iter()
-                    .position(|t| t == tag)
-                    .ok_or("field outside supported MassQuote group")?;
-                if previous.is_some_and(|prev| pos <= prev) {
-                    return Err("MassQuote group fields out of order".into());
-                }
-                previous = Some(pos);
-            }
+            // Scope, delimiters and dictionary order were validated in place
+            // before extracting business values, including ignored extensions.
             let level = match get(301).unwrap_or("0") {
                 "0" => 0,
                 "1" => 1,
@@ -904,7 +1024,7 @@ mod tests {
             "38=1|44=wrong|",
             "38=1|44=100|59=4|",
             "38=1|44=100|11=duplicate|",
-            "38=1|44=100|18=1|",
+            "38=1|44=100|9001=a|9001=b|",
         ] {
             assert!(
                 decode(&message(&format!("{base}{suffix}"))).is_err(),
@@ -966,6 +1086,123 @@ mod tests {
         let bad =
             message("35=i|117=q|296=1|302=s|311=AAPL|304=1|295=1|299=e|55=AAPL|134=10|132=99|");
         assert!(decode(&bad).is_err());
+    }
+
+    #[test]
+    fn default_compatibility_ignores_scalars_for_every_supported_message() {
+        let cases = [
+            "35=A|98=0|108=30|383=4096|",
+            "35=0|112=probe|",
+            "35=1|112=probe|",
+            "35=2|7=1|16=0|",
+            "35=3|45=2|373=1|",
+            "35=4|36=4|123=Y|",
+            "35=5|58=bye|",
+            "35=D|11=a|21=1|55=AAPL|54=1|60=20260914-01:02:03|40=2|38=1|44=100|1=account|18=1|",
+            "35=F|11=b|41=a|55=AAPL|54=1|60=20260914-01:02:03|1=account|",
+            "35=G|11=b|41=a|21=1|55=AAPL|54=1|60=20260914-01:02:03|40=2|38=1|44=100|1=account|",
+            "35=8|37=ex|17=e|20=0|150=0|39=0|55=AAPL|54=1|151=1|14=0|6=0|1=account|",
+            "35=9|37=ex|11=b|41=a|39=0|434=1|1=account|",
+            "35=i|117=q|131=request|9002=root|296=1|302=s|311=AAPL|312=underlying-suffix|9003=set|304=1|295=1|299=e|55=AAPL|65=suffix|9004=entry|132=99|133=101|134=10|135=10|",
+            "35=b|297=0|131=request|",
+            "35=d|320=r|322=s|323=4|393=1|55=AAPL|48=2|15=USD|",
+            "35=j|372=D|380=0|",
+        ];
+        for body in cases {
+            let baseline = decode(&message(body)).unwrap();
+            let extended = decode(&message(&format!("{body}9001=extension|"))).unwrap();
+            // The business event remains identical; retained scalar metadata
+            // does not acquire any new business semantics.
+            assert_eq!(format!("{baseline:?}"), format!("{extended:?}"), "{body}");
+        }
+        let m = message("35=D|50=sub-id|9001=before|11=a|21=1|55=AAPL|9002=middle|54=1|60=20260914-01:02:03|40=2|38=1|44=100|");
+        assert!(matches!(decode(&m), Ok(Inbound::NewOrderSingle { .. })));
+    }
+
+    #[test]
+    fn compatibility_keeps_semantic_and_structural_rejections() {
+        let base =
+            "35=D|11=a|21=1|55=AAPL|54=1|60=20260914-01:02:03|40=2|38=1|44=100|9001=extension|";
+        for (from, to) in [
+            ("11=a|", ""),
+            ("40=2|", "40=3|"),
+            ("38=1|", "38=bad|"),
+            ("54=1|", "54=3|"),
+            ("21=1|", "21=2|"),
+        ] {
+            assert!(decode(&message(&base.replace(from, to))).is_err(), "{to}");
+        }
+        for suffix in [
+            "59=4|",
+            "11=duplicate|",
+            "9001=duplicate|",
+            "1=a|1=b|",
+            "50=late-header|",
+        ] {
+            assert!(
+                decode(&message(&format!("{base}{suffix}"))).is_err(),
+                "{suffix}"
+            );
+        }
+        for suffix in [
+            "78=1|79=account|80=1|",
+            "386=1|336=session|",
+            "95=4|96=data|",
+            "354=4|355=data|",
+        ] {
+            let error = decode(&message(&format!("{base}{suffix}"))).unwrap_err();
+            assert!(
+                error.contains("group") || error.contains("length/data"),
+                "{error}"
+            );
+        }
+        let quote = "35=i|117=q|296=1|302=s|311=AAPL|304=1|295=1|299=e|55=AAPL|132=99|133=101|134=10|135=10|";
+        for malformed in [
+            quote.replace("296=1|", "296=2|"),
+            quote.replace("295=1|", "295=2|"),
+            quote.replace("302=s|", "9002=before-delimiter|302=s|"),
+            quote.replace("299=e|", "9002=before-delimiter|299=e|"),
+            quote.replace("304=1|", ""),
+            quote.replace("132=99|133=101|", "133=101|9002=middle|132=99|"),
+            quote.replace("311=AAPL|", "311=AAPL|55=wrong-scope|"),
+            quote.replace("135=10|", "135=10|312=wrong-scope|"),
+        ] {
+            assert!(decode(&message(&malformed)).is_err(), "{malformed}");
+        }
+        for kind in ["c", "H", "V"] {
+            assert!(matches!(
+                decode(&message(&format!("35={kind}|9001=extension|"))),
+                Ok(Inbound::Unsupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn compatibility_preserves_the_original_frame() {
+        let body = build_new_order_single(
+            OrderIdForWire("extended".into()),
+            "AAPL",
+            Side::Buy,
+            OrderType::Limit,
+            Decimal::from(100),
+            Decimal::ONE,
+        );
+        let mut extended = body;
+        extended.extend([
+            (1, "external-account".into()),
+            (9001, "raw-extension".into()),
+        ]);
+        let bytes = crate::fix::frame::frame("FIX.4.2", "D", 1, "CLIENT", "GOX", &extended);
+        let parsed = crate::fix::frame::read_message(&mut std::io::Cursor::new(&bytes))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            decode(&parsed),
+            Ok(Inbound::NewOrderSingle { .. })
+        ));
+        assert_eq!(parsed.raw.as_bytes(), bytes);
+        assert_eq!(parsed.get(9001), Some("raw-extension"));
+        assert_eq!(parsed.get(1), Some("external-account"));
     }
 
     #[test]

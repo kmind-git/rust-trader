@@ -1,15 +1,16 @@
-//! QuickFIX/Go-style per-session FIX logs.
+//! QuickFIX/J-style per-session FIX logs, rotated by the local calendar date.
 //!
-//! Two files are kept per session under `FileLogPath`:
-//! `messages.current.log` records every raw inbound/outbound message and
-//! `event.current.log` records session events. The `in`/`out` marker and the
-//! fixed UTC+8 event timestamp are explicit project extensions; FIX fields
-//! such as SendingTime(52) remain UTC.
+//! Each `FileLogPath/YYYY-MM-DD` directory contains a session's
+//! `messages.log` (unchanged raw inbound/outbound messages) and `event.log`.
+//! Lines use `YYYYMMDD-HH:MM:SS.mmm: ` with local time; FIX fields 52/60
+//! continue to use UTC. This logger is independent of `RUST_LOG`.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use chrono::{DateTime, FixedOffset, Local, NaiveDate};
 
 use super::config::{ConfigError, FixConfig, SessionSettings};
 
@@ -24,9 +25,7 @@ pub struct LogConfig {
 }
 
 impl LogConfig {
-    /// Build logging settings from a resolved `[SESSION]` map. This is the
-    /// only constructor used by the binaries, so invalid boolean values are
-    /// reported instead of silently disabling logging.
+    /// Build logging settings from a resolved `[SESSION]` map.
     pub fn from_settings(
         settings: &SessionSettings,
         default_dir: &str,
@@ -45,8 +44,7 @@ impl LogConfig {
         })
     }
 
-    /// Compatibility helper for callers that intentionally inspect DEFAULT
-    /// values. New startup code should resolve a session first.
+    /// Compatibility helper for callers that intentionally inspect DEFAULT.
     pub fn from_config(config: &FixConfig, default_dir: &str) -> Result<LogConfig, ConfigError> {
         Self::from_settings(&config.defaults, default_dir)
     }
@@ -55,104 +53,212 @@ impl LogConfig {
 /// Cloneable handle shared between a session's reader and writer threads.
 #[derive(Clone)]
 pub struct SessionLog {
-    inner: Arc<SessionLogInner>,
+    inner: Arc<Mutex<Option<DailyFiles>>>,
 }
 
-struct SessionLogInner {
-    messages: Mutex<Option<File>>,
-    event: Mutex<Option<File>>,
+struct DailyFiles {
+    dir: PathBuf,
+    prefix: String,
+    date: NaiveDate,
+    retention_days: u64,
+    messages: File,
+    event: File,
+}
+
+impl DailyFiles {
+    fn open(
+        dir: PathBuf,
+        prefix: String,
+        date: NaiveDate,
+        retention_days: u64,
+    ) -> std::io::Result<Self> {
+        let (messages, event) = open_files(&dir, &prefix, date)?;
+        let files = Self {
+            dir,
+            prefix,
+            date,
+            retention_days,
+            messages,
+            event,
+        };
+        files.prune();
+        Ok(files)
+    }
+
+    fn rotate(&mut self, date: NaiveDate) -> std::io::Result<()> {
+        if self.date == date {
+            return Ok(());
+        }
+        // Open both files before switching. A failure does not silently write
+        // a new day's records into yesterday's log.
+        let (messages, event) = open_files(&self.dir, &self.prefix, date)?;
+        self.messages = messages;
+        self.event = event;
+        self.date = date;
+        self.prune();
+        Ok(())
+    }
+
+    fn prune(&self) {
+        if let Err(error) =
+            prune_session_logs(&self.dir, &self.prefix, self.date, self.retention_days)
+        {
+            log::warn!("FIX log retention cleanup failed: {error}");
+        }
+    }
+}
+
+fn open_files(dir: &Path, prefix: &str, date: NaiveDate) -> std::io::Result<(File, File)> {
+    let daily_dir = dir.join(date.format("%Y-%m-%d").to_string());
+    std::fs::create_dir_all(&daily_dir)?;
+    let open = |suffix: &str| {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(daily_dir.join(format!("{prefix}.{suffix}.log")))
+    };
+    Ok((open("messages")?, open("event")?))
+}
+
+/// Resolve `FIX_LOG_RETENTION_DAYS` from runtime settings (environment first);
+/// zero explicitly disables deletion.
+/// Startup validation can call this before opening any listening ports.
+pub fn retention_days() -> std::io::Result<u64> {
+    let root = crate::runtime::installation_root()?;
+    let settings = crate::runtime::RuntimeSettings::load(&root)?;
+    settings.days("FIX_LOG_RETENTION_DAYS").map(u64::from)
+}
+
+/// Delete only this session's two known log files from expired date
+/// directories. Never recursively remove a directory or follow symlinks.
+fn prune_session_logs(
+    dir: &Path,
+    prefix: &str,
+    today: NaiveDate,
+    days: u64,
+) -> std::io::Result<()> {
+    if days == 0 {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(name, "%Y-%m-%d") else {
+            continue;
+        };
+        if date.format("%Y-%m-%d").to_string() != name {
+            continue;
+        }
+        let age = today.signed_duration_since(date).num_days();
+        if age < 0 || (age as u64) < days {
+            continue;
+        }
+        for suffix in ["messages", "event"] {
+            let path = entry.path().join(format!("{prefix}.{suffix}.log"));
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        // Other sessions or user files keep the directory alive.
+        let _ = std::fs::remove_dir(entry.path());
+    }
+    Ok(())
 }
 
 impl SessionLog {
-    /// Create the two log files eagerly. The caller can warn and use
-    /// [`SessionLog::disabled`] if the directory or files cannot be opened.
+    /// Eagerly create today's two files and apply the retention policy.
     pub fn new(
         dir: &str,
         begin_string: &str,
         sender: &str,
         target: &str,
     ) -> std::io::Result<SessionLog> {
-        std::fs::create_dir_all(dir)?;
-        let prefix = filename_prefix(begin_string, sender, target);
-        let open = |name: &str| {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(PathBuf::from(dir).join(name))
-        };
-        let messages = open(&format!("{prefix}.messages.current.log"))?;
-        let event = open(&format!("{prefix}.event.current.log"))?;
+        Self::new_at(
+            PathBuf::from(dir),
+            filename_prefix(begin_string, sender, target),
+            Local::now().date_naive(),
+            retention_days()?,
+        )
+    }
+
+    fn new_at(
+        dir: PathBuf,
+        prefix: String,
+        date: NaiveDate,
+        days: u64,
+    ) -> std::io::Result<SessionLog> {
         Ok(SessionLog {
-            inner: Arc::new(SessionLogInner {
-                messages: Mutex::new(Some(messages)),
-                event: Mutex::new(Some(event)),
-            }),
+            inner: Arc::new(Mutex::new(Some(DailyFiles::open(dir, prefix, date, days)?))),
         })
     }
 
     /// Disabled handle: `Logging=N`, every write is a no-op.
     pub fn disabled() -> SessionLog {
         SessionLog {
-            inner: Arc::new(SessionLogInner {
-                messages: Mutex::new(None),
-                event: Mutex::new(None),
-            }),
+            inner: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Record an inbound raw message. The message bytes are written without
-    /// UTF-8 reconstruction, preserving SOH and any valid ASCII data exactly.
+    /// Write received bytes unchanged, including all ignored extension fields.
     pub fn incoming(&self, raw: &str) {
-        self.write_message("in", raw.as_bytes());
+        self.write_record(false, raw.as_bytes(), Local::now().fixed_offset());
     }
 
     /// Record an outbound raw message.
     pub fn outgoing(&self, raw: &str) {
-        self.write_message("out", raw.as_bytes());
+        self.write_record(false, raw.as_bytes(), Local::now().fixed_offset());
     }
 
-    /// Record bytes retained by the frame decoder after a malformed or
-    /// truncated frame. Hex encoding is used so arbitrary bytes cannot inject
-    /// line breaks into the messages log while remaining lossless.
+    /// Preserve malformed/truncated frames losslessly as hex so arbitrary
+    /// bytes cannot inject line breaks into the messages log.
     pub fn incoming_bytes(&self, raw: &[u8]) {
-        let mut encoded = String::with_capacity(raw.len() * 2);
+        let mut encoded = String::with_capacity(7 + raw.len() * 2);
+        encoded.push_str("in-hex ");
         for byte in raw {
             use std::fmt::Write as _;
             let _ = write!(&mut encoded, "{byte:02X}");
         }
-        self.write_message("in-hex", encoded.as_bytes());
+        self.write_record(false, encoded.as_bytes(), Local::now().fixed_offset());
     }
 
     /// Record a session state-machine event.
     pub fn event(&self, text: &str) {
-        let mut guard = self.inner.event.lock().unwrap();
-        if let Some(file) = guard.as_mut() {
-            let result = writeln!(file, "{} {}", timestamp(), text);
-            warn_write_failure("event", result);
-        }
+        self.write_record(true, text.as_bytes(), Local::now().fixed_offset());
     }
 
-    fn write_message(&self, direction: &str, raw: &[u8]) {
-        let mut guard = self.inner.messages.lock().unwrap();
-        if let Some(file) = guard.as_mut() {
+    fn write_record(&self, event: bool, raw: &[u8], now: DateTime<FixedOffset>) {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(files) = guard.as_mut() {
             let result = (|| {
-                write!(file, "{} {} ", timestamp(), direction)?;
+                files.rotate(now.date_naive())?;
+                let file = if event {
+                    &mut files.event
+                } else {
+                    &mut files.messages
+                };
+                write!(file, "{}: ", now.format("%Y%m%d-%H:%M:%S%.3f"))?;
                 file.write_all(raw)?;
                 file.write_all(b"\n")
             })();
-            warn_write_failure("message", result);
+            if let Err(error) = result {
+                log::warn!(
+                    "FIX {} log write failed: {error}",
+                    if event { "event" } else { "message" }
+                );
+            }
         }
     }
 }
 
-fn warn_write_failure(kind: &str, result: std::io::Result<()>) {
-    if let Err(error) = result {
-        log::warn!("FIX {kind} log write failed: {error}");
-    }
-}
-
-/// Filename prefix following QuickFIX/Go's shape while preventing a CompID
-/// or BeginString from introducing a path separator/control character.
+/// Session filename prefix, with path separators/control characters removed.
 pub fn filename_prefix(begin_string: &str, sender: &str, target: &str) -> String {
     format!(
         "{}-{}-{}",
@@ -179,16 +285,6 @@ fn safe_filename_component(value: &str) -> String {
     component
 }
 
-/// Log line timestamp: Beijing time (UTC+8, fixed offset) with microseconds.
-/// This is a readability extension; FIX field timestamps stay UTC.
-fn timestamp() -> String {
-    let beijing = chrono::FixedOffset::east_opt(8 * 3600).expect("UTC+8 is a valid offset");
-    chrono::Utc::now()
-        .with_timezone(&beijing)
-        .format("%Y-%m-%d %H:%M:%S%.6f")
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +297,14 @@ mod tests {
             .join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    fn date(value: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap()
+    }
+
+    fn time(value: &str) -> DateTime<FixedOffset> {
+        DateTime::parse_from_rfc3339(value).unwrap()
     }
 
     #[test]
@@ -218,26 +322,165 @@ mod tests {
     #[test]
     fn test_log_files_written() {
         let dir = test_dir("written");
-        let log = SessionLog::new(dir.to_str().unwrap(), "FIX.4.2", "GOX", "CLIENT").unwrap();
-        log.incoming("8=FIX.4.2\x0135=A\x0110=000\x01");
-        log.outgoing("8=FIX.4.2\x0135=0\x0110=000\x01");
-        log.incoming_bytes(&[0, 0xFF, b'\n']);
-        log.event("Received logon request");
+        let prefix = filename_prefix("FIX.4.2", "GOX", "CLIENT");
+        let log = SessionLog::new_at(dir.clone(), prefix.clone(), date("2026-10-27"), 14).unwrap();
+        let now = time("2026-10-27T09:30:01.123+05:30");
+        let inbound = b"8=FIX.4.2\x0135=A\x019001=abc\x0110=000\x01";
+        let outbound = b"8=FIX.4.2\x0135=0\x0110=000\x01";
+        log.write_record(false, inbound, now);
+        log.write_record(false, outbound, now);
+        log.write_record(true, b"Received logon request", now);
         drop(log);
 
+        let daily = dir.join("2026-10-27");
+        let messages = std::fs::read(daily.join(format!("{prefix}.messages.log"))).unwrap();
+        let mut expected = b"20261027-09:30:01.123: ".to_vec();
+        expected.extend_from_slice(inbound);
+        expected.extend_from_slice(b"\n20261027-09:30:01.123: ");
+        expected.extend_from_slice(outbound);
+        expected.push(b'\n');
+        assert_eq!(messages, expected);
+        assert_eq!(
+            std::fs::read_to_string(daily.join(format!("{prefix}.event.log"))).unwrap(),
+            "20261027-09:30:01.123: Received logon request\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_midnight_rotates_both_logs_using_local_date() {
+        let dir = test_dir("midnight");
         let prefix = filename_prefix("FIX.4.2", "GOX", "CLIENT");
-        let messages = std::fs::read(dir.join(format!("{prefix}.messages.current.log"))).unwrap();
-        assert!(messages
-            .windows(b" in 8=FIX.4.2\x0135=A\x0110=000\x01\n".len())
-            .any(|window| window == b" in 8=FIX.4.2\x0135=A\x0110=000\x01\n"));
-        assert!(messages
-            .windows(b" out 8=FIX.4.2\x0135=0\x0110=000\x01\n".len())
-            .any(|window| window == b" out 8=FIX.4.2\x0135=0\x0110=000\x01\n"));
-        let text = String::from_utf8(messages).unwrap();
-        assert!(text.contains(" in-hex 00FF0A\n"));
-        let event =
-            std::fs::read_to_string(dir.join(format!("{prefix}.event.current.log"))).unwrap();
-        assert!(event.contains("Received logon request"));
+        let log = SessionLog::new_at(dir.clone(), prefix.clone(), date("2026-10-27"), 14).unwrap();
+        log.write_record(false, b"before", time("2026-10-27T23:59:59.999-04:00"));
+        log.write_record(true, b"after event", time("2026-10-28T00:00:00.000-04:00"));
+        log.write_record(
+            false,
+            b"after message",
+            time("2026-10-28T00:00:00.001-04:00"),
+        );
+        drop(log);
+        assert_eq!(
+            std::fs::read_to_string(
+                dir.join("2026-10-27")
+                    .join(format!("{prefix}.messages.log"))
+            )
+            .unwrap(),
+            "20261027-23:59:59.999: before\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                dir.join("2026-10-28")
+                    .join(format!("{prefix}.messages.log"))
+            )
+            .unwrap(),
+            "20261028-00:00:00.001: after message\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("2026-10-28").join(format!("{prefix}.event.log")))
+                .unwrap(),
+            "20261028-00:00:00.000: after event\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_rotation_failure_does_not_append_to_previous_day() {
+        let dir = test_dir("rotation-failure");
+        let prefix = filename_prefix("FIX.4.2", "GOX", "CLIENT");
+        let log = SessionLog::new_at(dir.clone(), prefix.clone(), date("2026-10-27"), 0).unwrap();
+        log.write_record(false, b"before", time("2026-10-27T23:59:59Z"));
+        // A regular file prevents creation of tomorrow's date directory.
+        std::fs::write(dir.join("2026-10-28"), b"obstacle").unwrap();
+        log.write_record(
+            false,
+            b"must not enter yesterday",
+            time("2026-10-28T00:00:00Z"),
+        );
+        drop(log);
+        assert_eq!(
+            std::fs::read_to_string(
+                dir.join("2026-10-27")
+                    .join(format!("{prefix}.messages.log"))
+            )
+            .unwrap(),
+            "20261027-23:59:59.000: before\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_retention_only_removes_own_expired_files() {
+        let dir = test_dir("retention");
+        let prefix = filename_prefix("FIX.4.2", "GOX", "CLIENT");
+        for name in [
+            "2026-10-12",
+            "2026-10-13",
+            "2026-10-14",
+            "2026-10-28",
+            "not-a-date",
+        ] {
+            let daily = dir.join(name);
+            std::fs::create_dir_all(&daily).unwrap();
+            std::fs::write(daily.join(format!("{prefix}.messages.log")), "messages").unwrap();
+            std::fs::write(daily.join(format!("{prefix}.event.log")), "event").unwrap();
+        }
+        std::fs::write(dir.join("2026-10-13/another.messages.log"), "other session").unwrap();
+        std::fs::write(dir.join("2026-10-13/keep.txt"), "user file").unwrap();
+        let log = SessionLog::new_at(dir.clone(), prefix.clone(), date("2026-10-27"), 14).unwrap();
+        assert!(!dir.join("2026-10-12").exists());
+        assert!(!dir
+            .join("2026-10-13")
+            .join(format!("{prefix}.messages.log"))
+            .exists());
+        assert!(!dir
+            .join("2026-10-13")
+            .join(format!("{prefix}.event.log"))
+            .exists());
+        assert!(dir.join("2026-10-13/another.messages.log").exists());
+        assert!(dir.join("2026-10-13/keep.txt").exists());
+        for name in ["2026-10-14", "2026-10-28", "not-a-date"] {
+            assert!(dir
+                .join(name)
+                .join(format!("{prefix}.messages.log"))
+                .exists());
+        }
+        drop(log);
+        // Rotation applies retention again, including for an existing session.
+        let log = SessionLog::new_at(dir.clone(), prefix.clone(), date("2026-10-27"), 14).unwrap();
+        log.write_record(true, b"next day", time("2026-10-28T00:00:00Z"));
+        assert!(!dir.join("2026-10-14").exists());
+        drop(log);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_zero_retention_keeps_old_logs() {
+        let dir = test_dir("keep-all");
+        let prefix = filename_prefix("FIX.4.2", "GOX", "CLIENT");
+        let old = dir.join("2000-01-01");
+        std::fs::create_dir_all(&old).unwrap();
+        let path = old.join(format!("{prefix}.messages.log"));
+        std::fs::write(&path, "keep").unwrap();
+        let log = SessionLog::new_at(dir.clone(), prefix, date("2026-10-27"), 0).unwrap();
+        assert!(path.exists());
+        drop(log);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_incoming_bytes_preserved_as_hex() {
+        let dir = test_dir("hex");
+        let prefix = filename_prefix("FIX.4.2", "GOX", "CLIENT");
+        let log =
+            SessionLog::new_at(dir.clone(), prefix.clone(), Local::now().date_naive(), 0).unwrap();
+        log.incoming_bytes(&[0, 0xFF, b'\n']);
+        drop(log);
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        let daily = entries[0].as_ref().unwrap().path();
+        let messages =
+            std::fs::read_to_string(daily.join(format!("{prefix}.messages.log"))).unwrap();
+        assert!(messages.ends_with(": in-hex 00FF0A\n"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
